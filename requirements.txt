@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+python-telegram-bot
+requests
+schedule
+oandapyV20
+mcp
