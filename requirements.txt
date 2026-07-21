@@ -5,3 +5,5 @@ requests
 schedule
 oandapyV20
 mcp
+python-dotenv
+six
