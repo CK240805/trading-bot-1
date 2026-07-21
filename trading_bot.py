@@ -1,6 +1,7 @@
 """
 Autonomous Trading Bot – DeepSeek + OANDA + Telegram + MCP (Trader.dev)
-Single-file version. Dynamic watch list determined by DeepSeek LLM.
+Dynamic watch list determined by DeepSeek LLM.
+LLM-driven strategy optimization loop using Trader.dev via MCP proxy.
 Set all required environment variables before running.
 """
 import os, json, time, logging, threading, asyncio
@@ -20,9 +21,16 @@ import oandapyV20.endpoints.pricing as pricing
 import oandapyV20.endpoints.trades as trades
 import oandapyV20.endpoints.accounts as accounts
 
-# MCP (simple subprocess client – adjust to your server)
+# MCP client
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+# Load .env file locally (ignored on Render)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -32,21 +40,20 @@ logger = logging.getLogger("TradingBot")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 OANDA_API_KEY = os.getenv("OANDA_API_KEY")
-OANDA_ENV = os.getenv("OANDA_ENV", "practice")  # practice or live
+OANDA_ENV = os.getenv("OANDA_ENV", "practice")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MCP_SERVER_COMMAND = os.getenv("MCP_SERVER_COMMAND", "python")
 MCP_SERVER_ARGS = os.getenv("MCP_SERVER_ARGS", "mcp_server.py").split()
 ALLOCATED_CAPITAL = 100.0  # hard cap in USD
 
-# OANDA API base
+# Trader.dev API (used by MCP proxy, but may be needed if you want direct calls – keep as env)
+TRADERDEV_API_KEY = os.getenv("TRADERDEV_API_KEY")
+
 OANDA_URL = "https://api-fxpractice.oanda.com" if OANDA_ENV == "practice" else "https://api-fxtrade.oanda.com"
 oanda_api = API(access_token=OANDA_API_KEY, environment=OANDA_ENV)
 
-# Default timeframe (can be overridden by LLM)
 DEFAULT_TIMEFRAME = "M5"
-
-# Dynamic watch list – updated regularly by DeepSeek
 CURRENT_WATCHLIST: List[str] = []
 
 # ---------- DeepSeek Client ----------
@@ -69,7 +76,7 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
         return ""
     return resp.json()["choices"][0]["message"]["content"]
 
-# ---------- News Fetcher (free NewsAPI) ----------
+# ---------- News Fetcher ----------
 def fetch_news() -> str:
     api_key = os.getenv("NEWS_API_KEY")
     if not api_key:
@@ -84,10 +91,6 @@ def fetch_news() -> str:
 
 # ---------- Dynamic Watch List ----------
 def update_watch_list() -> List[str]:
-    """
-    Asks DeepSeek to pick the best instruments to trade right now.
-    Returns a list of OANDA instrument names.
-    """
     news = fetch_news()
     system = (
         "You are a professional financial market analyst. "
@@ -98,9 +101,7 @@ def update_watch_list() -> List[str]:
     )
     prompt = f"Recent financial news headlines:\n{news}\n\nCurrent datetime: {datetime.now().isoformat()}\n\nProvide the JSON array."
     response = deepseek_chat(prompt, system)
-    # Attempt to parse JSON array
     try:
-        # Sometimes response is wrapped in markdown code fences
         if "```" in response:
             snippet = response.split("```")[1]
             if snippet.startswith("json"):
@@ -112,8 +113,7 @@ def update_watch_list() -> List[str]:
             logger.info(f"Updated watch list: {watchlist}")
             return watchlist
     except Exception as e:
-        logger.error(f"Failed to parse watch list from LLM: {e}")
-    # Fallback to a safe default if parsing fails
+        logger.error(f"Failed to parse watch list: {e}")
     logger.warning("Using default watch list.")
     return ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
 
@@ -196,50 +196,82 @@ async def send_telegram_message(text: str):
 def tg_send_sync(text: str):
     asyncio.run(send_telegram_message(text))
 
-# ---------- MCP Client (Strategy Optimization) ----------
-class MCPOptimizer:
+# ---------- LLM-Driven Strategy Optimizer (uses MCP proxy -> Trader.dev) ----------
+class LLMStrategyOptimizer:
     def __init__(self):
-        self.best_params = None
-        self.best_metric = -9999
+        self.best_strategy = None
+        self.best_sharpe = -9999
 
-    async def run_optimization_loop(self):
+    async def _call_mcp_backtest(self, strategy: dict, instrument="EUR_USD", timeframe="H1") -> float:
         server_params = StdioServerParameters(command=MCP_SERVER_COMMAND, args=MCP_SERVER_ARGS)
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = await session.list_tools()
-                logger.info(f"MCP tools available: {[t.name for t in tools]}")
-                if not any(t.name == "backtest" for t in tools):
-                    logger.error("MCP server missing 'backtest' tool.")
-                    return
-                current_params = self.best_params or {"ma_fast": 10, "ma_slow": 30}
-                for _ in range(10):
-                    backtest_result = await session.call_tool("backtest", arguments=current_params)
-                    metric = backtest_result.get("sharpe", 0)
-                    if metric > self.best_metric:
-                        self.best_metric = metric
-                        self.best_params = current_params
-                        logger.info(f"New best: Sharpe={metric:.3f}, params={current_params}")
-                        if metric >= 2.0:
-                            logger.info("Amazing strategy found!")
-                            break
-                    if any(t.name == "optimize" for t in tools):
-                        optimize_result = await session.call_tool("optimize", arguments=current_params)
-                        current_params = optimize_result.get("params", current_params)
-                    else:
-                        break
-        logger.info(f"Optimization cycle completed. Best Sharpe={self.best_metric:.3f}, params={self.best_params}")
+                if not any(t.name == "backtest_strategy" for t in tools):
+                    logger.error("MCP server missing 'backtest_strategy' tool.")
+                    return 0.0
+                result = await session.call_tool(
+                    "backtest_strategy",
+                    arguments={
+                        "strategy": strategy,
+                        "instrument": instrument,
+                        "timeframe": timeframe
+                    }
+                )
+                return result.get("sharpe", 0.0)
 
-mcp_optimizer = MCPOptimizer()
+    async def run_optimization_loop(self):
+        system = (
+            "You are an expert quantitative trading strategist. "
+            "You must output a valid JSON object that represents a complete trading strategy "
+            "in the exact format required by the Trader.dev backtesting API. "
+            "You are free to use any indicators, entry/exit rules, and risk management. "
+            "Reply ONLY with the JSON object, no other text."
+        )
+        user = "Propose an initial trading strategy for EUR/USD on H1 timeframe. Be creative but use standard indicators."
+        response = deepseek_chat(user, system)
+        try:
+            current_strategy = json.loads(response)
+        except:
+            logger.error("Failed to parse initial strategy from LLM")
+            return
+
+        for i in range(10):
+            logger.info(f"Iteration {i+1}: Testing strategy...")
+            sharpe = await self._call_mcp_backtest(current_strategy)
+            logger.info(f"Sharpe = {sharpe:.3f}")
+
+            if sharpe > self.best_sharpe:
+                self.best_sharpe = sharpe
+                self.best_strategy = current_strategy
+                if sharpe >= 2.0:
+                    logger.info(f"Amazing strategy found! Sharpe = {sharpe:.3f}")
+                    break
+
+            improvement_prompt = (
+                f"The last strategy (JSON below) achieved a Sharpe ratio of {sharpe:.3f}. "
+                f"Propose an improved version of this strategy that you expect will have a higher Sharpe. "
+                f"Return ONLY the new JSON strategy, no additional text.\n\n"
+                f"Previous strategy: {json.dumps(current_strategy)}"
+            )
+            response = deepseek_chat(improvement_prompt, system)
+            try:
+                current_strategy = json.loads(response)
+            except:
+                logger.error("Could not parse improved strategy, stopping loop.")
+                break
+
+        logger.info(f"Optimization ended. Best Sharpe: {self.best_sharpe:.3f}")
+
+llm_strategy_optimizer = LLMStrategyOptimizer()
 
 def mcp_optimization_runner():
-    asyncio.run(mcp_optimizer.run_optimization_loop())
+    asyncio.run(llm_strategy_optimizer.run_optimization_loop())
 
 # ---------- Morning Analysis Job ----------
 def morning_analysis():
-    logger.info("Running morning analysis with dynamic watch list...")
     global CURRENT_WATCHLIST
-    # Update watch list first
     CURRENT_WATCHLIST = update_watch_list()
     prices = oanda_get_prices(CURRENT_WATCHLIST)
     news = fetch_news()
@@ -249,14 +281,12 @@ Recent news headlines:
 {news}
 
 Provide a concise morning market outlook for the above instruments. Keep under 400 words."""
-    system = "You are a professional financial market analyst."
-    analysis = deepseek_chat(prompt, system)
-    message = f"🌅 *Morning Market Analysis* ({datetime.now().strftime('%Y-%m-%d')})\n\n🎯 Today's watch list: {', '.join(CURRENT_WATCHLIST)}\n\n{analysis}"
+    analysis = deepseek_chat(prompt, "You are a professional financial market analyst.")
+    message = f"🌅 *Morning Market Analysis* ({datetime.now().strftime('%Y-%m-%d')})\n\n🎯 Watch list: {', '.join(CURRENT_WATCHLIST)}\n\n{analysis}"
     tg_send_sync(message)
 
 # ---------- Night Performance Report Job ----------
 def night_performance():
-    logger.info("Generating nightly performance report...")
     summary = oanda_get_account_summary()
     trades_list = oanda_get_open_trades()
     pnl = float(summary.get("unrealizedPL", 0))
@@ -272,10 +302,9 @@ def night_performance():
 {open_trades_text if open_trades_text else "None"}"""
     tg_send_sync(message)
 
-# ---------- Trading Decision Loop (every minute) ----------
+# ---------- Trading Decision Loop ----------
 def trading_decision():
     global CURRENT_WATCHLIST
-    # If watch list is empty, get a default or update
     if not CURRENT_WATCHLIST:
         CURRENT_WATCHLIST = update_watch_list()
     try:
@@ -283,64 +312,43 @@ def trading_decision():
         open_trades = oanda_get_open_trades()
         news = fetch_news()
         system_prompt = f"""You are an autonomous trading bot. You manage a $100 allocation on OANDA demo.
-You can trade only the instruments in the current watch list: {', '.join(CURRENT_WATCHLIST)}.
+You can trade only instruments from this list: {', '.join(CURRENT_WATCHLIST)}.
 Your goal is to maximise profit while respecting a total exposure of $100.
-You must respond ONLY with a JSON object following this exact structure:
-{{
-  "action": "BUY"|"SELL"|"HOLD",
-  "instrument": "EUR_USD",
-  "units": 1000,
-  "stop_loss": 1.0500,
-  "take_profit": 1.0600,
-  "timeframe": "M5",
-  "reasoning": "short explanation"
-}}
-If no trade is warranted, action must be HOLD and other fields can be null.
-Ensure total exposure (|units| * price) <= $100."""
-        user_prompt = f"""Current time: {datetime.now().isoformat()}
-Current prices (bid/ask): {json.dumps(prices)}
-Open positions: {json.dumps(open_trades)}
-News: {news}
-
-Analyse and provide the next trade action in JSON."""
+Respond ONLY with a JSON object: {{"action":"BUY"|"SELL"|"HOLD", "instrument":"...", "units":1000, "stop_loss":1.0500, "take_profit":1.0600, "timeframe":"M5", "reasoning":"..."}}.
+If HOLD, other fields can be null.
+Ensure |units| * price <= $100."""
+        user_prompt = f"Current time: {datetime.now().isoformat()}\nPrices: {json.dumps(prices)}\nOpen positions: {json.dumps(open_trades)}\nNews: {news}\n\nAnalyse and provide the next trade action in JSON."
         response = deepseek_chat(user_prompt, system_prompt)
-        logger.info(f"LLM decision raw: {response}")
-        # Parse JSON
         try:
             decision = json.loads(response)
-        except json.JSONDecodeError:
+        except:
             if "```" in response:
                 snippet = response.split("```")[1]
                 if snippet.startswith("json"):
                     snippet = snippet[4:]
                 decision = json.loads(snippet.strip())
             else:
-                logger.error("Could not parse LLM response")
                 return
-        if decision["action"] == "HOLD":
+        if decision.get("action") == "HOLD":
             return
         instrument = decision.get("instrument")
         units = decision.get("units", 0)
-        sl = decision.get("stop_loss")
-        tp = decision.get("take_profit")
         if instrument not in CURRENT_WATCHLIST or units == 0:
-            logger.info(f"Trade rejected: invalid instrument {instrument} or units {units}")
             return
         if not check_risk_allocation(instrument, units):
             return
-        oanda_place_order(instrument, units, sl, tp)
+        oanda_place_order(instrument, units, decision.get("stop_loss"), decision.get("take_profit"))
     except Exception as e:
         logger.exception(f"Trading decision error: {e}")
 
-# ---------- Watch List Refresh (every 4 hours) ----------
+# ---------- Watch List Refresh ----------
 def refresh_watch_list_job():
     global CURRENT_WATCHLIST
-    logger.info("Periodic watch list refresh.")
     CURRENT_WATCHLIST = update_watch_list()
 
 # ---------- Scheduler Thread ----------
 def run_scheduler():
-    schedule.every(5).minutes.do(mcp_optimization_runner)
+    schedule.every(5).minutes.do(mcp_optimization_runner)      # LLM-driven optimization
     schedule.every().day.at("07:00").do(morning_analysis)
     schedule.every().day.at("21:00").do(night_performance)
     schedule.every(1).minutes.do(trading_decision)
@@ -350,21 +358,19 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(1)
 
-# ---------- FastAPI App (for Render health check) ----------
+# ---------- FastAPI App ----------
 app = FastAPI()
 
 @app.on_event("startup")
 async def startup_event():
     threading.Thread(target=run_scheduler, daemon=True).start()
-    # Initialize watch list immediately
     global CURRENT_WATCHLIST
     CURRENT_WATCHLIST = update_watch_list()
     tg_send_sync(f"🤖 Trading bot started. Allocated capital: $100.\nWatch list: {', '.join(CURRENT_WATCHLIST)}")
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "best_sharpe": mcp_optimizer.best_metric, "watch_list": CURRENT_WATCHLIST}
+    return {"status": "ok", "best_sharpe": llm_strategy_optimizer.best_sharpe, "watch_list": CURRENT_WATCHLIST}
 
-# ---------- Run directly ----------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
