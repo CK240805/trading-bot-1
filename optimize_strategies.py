@@ -1,7 +1,7 @@
 """
 Pre‑trading strategy optimization – DeepSeek + Trader.dev MCP
-Generates Pine Script v6 strategies, runs async backtests, and polls for results.
-Saves the best strategy and Sharpe ratio to a GitHub Gist.
+Creates strategy, runs backtest, polls for result, extracts Sharpe.
+Saves the best strategy to a GitHub Gist.
 """
 import os, json, time, asyncio, requests, re
 from collections import deque
@@ -75,7 +75,7 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
 
 # ---------- Pine Script helpers ----------
 def clean_pine_code(code: str) -> str:
-    """Remove markdown fences, ensure version 6, fix settings for Trader.dev."""
+    """Remove markdown fences, ensure version 6, fix settings."""
     if "```" in code:
         parts = code.split("```")
         for part in parts:
@@ -89,123 +89,155 @@ def clean_pine_code(code: str) -> str:
     if not code.strip().startswith('//@version'):
         code = '//@version=6\n' + code
     code = re.sub(r'[^\x00-\x7F]+', '', code)
-
-    # Fix strategy settings to match Trader.dev requirements
+    # Fix strategy settings
     code = re.sub(r'pyramiding\s*=\s*\d+', 'pyramiding=1', code)
     code = re.sub(r'default_qty_type\s*=\s*strategy\.\w+', 'default_qty_type=strategy.percent_of_equity', code)
     code = re.sub(r'default_qty_value\s*=\s*\d+', 'default_qty_value=100', code)
     code = re.sub(r'initial_capital\s*=\s*\d+', 'initial_capital=10000', code)
-
     return code.strip()
 
-# ---------- MCP helpers ----------
+def generate_strategy_name() -> str:
+    """Generate a unique strategy name."""
+    return f"opt-{int(time.time())}"
+
+# ---------- MCP workflow ----------
 def extract_sharpe(text: str) -> float:
-    """Extract Sharpe ratio from backtest result."""
+    """Deep search for Sharpe in backtest result."""
     try:
         data = json.loads(text)
-        for path in [
-            lambda d: d.get("sharpe"),
-            lambda d: d.get("sharpe_ratio"),
-            lambda d: d.get("performance", {}).get("sharpe"),
-            lambda d: d.get("performance", {}).get("sharpe_ratio"),
-            lambda d: d.get("result", {}).get("sharpe"),
-            lambda d: d.get("backtest", {}).get("sharpe"),
-            lambda d: d.get("metrics", {}).get("sharpe"),
-            lambda d: d.get("totals", {}).get("sharpe_ratio"),
-        ]:
-            try:
-                val = path(data)
-                if val is not None and float(val) != 0.0:
-                    return float(val)
-            except:
-                pass
-        # Try any key containing "sharpe"
-        def find_sharpe(obj, depth=0):
-            if depth > 5:
+        def find(obj, depth=0):
+            if depth > 6:
                 return None
             if isinstance(obj, dict):
                 for k, v in obj.items():
                     if "sharpe" in k.lower() and isinstance(v, (int, float)):
                         return float(v)
-                    result = find_sharpe(v, depth + 1)
-                    if result is not None:
-                        return result
+                    r = find(v, depth + 1)
+                    if r is not None:
+                        return r
             return None
-        val = find_sharpe(data)
+        val = find(data)
         if val is not None:
             return val
     except:
         pass
-
     match = re.search(r'sharpe["\']?\s*[:=]\s*([0-9.]+)', text, re.IGNORECASE)
     if match:
         return float(match.group(1))
-
     return 0.0
 
-async def run_and_get_backtest(session, pine_code: str, symbol: str, timeframe: str) -> float:
-    """Run a backtest and poll for the result."""
+async def create_and_backtest(session, pine_code: str, symbol: str, timeframe: str) -> float:
+    """Full workflow: create strategy → run backtest → poll result → return Sharpe."""
     pine_code = clean_pine_code(pine_code)
-    print(f"Pine preview: {pine_code.split(chr(10))[:2]}")
+    strategy_name = generate_strategy_name()
 
+    # Step 1: Create the strategy
+    print(f"Creating strategy '{strategy_name}'…")
     try:
-        # Step 1: Run the backtest
         result = await session.call_tool(
-            "run_backtest",
+            "create_strategy",
             arguments={
+                "name": strategy_name,
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "pineSource": pine_code
             }
         )
-        if result.content and len(result.content) > 0:
-            text = result.content[0].text
-            print(f"Run backtest response: {text[:500]}")
+        if not result.content or len(result.content) == 0:
+            print("Create strategy returned empty.")
+            return 0.0
 
-            # Try to extract backtest ID from the response
-            backtest_id = None
-            try:
-                data = json.loads(text)
-                backtest_id = data.get("id") or data.get("backtest_id") or data.get("backtestId")
-            except:
-                # Maybe the ID is just the text itself
-                if len(text) < 100 and not "error" in text.lower():
-                    backtest_id = text.strip()
+        text = result.content[0].text
+        print(f"Create response: {text[:300]}")
 
-            if not backtest_id:
-                # Try get_backtest_result without ID (maybe it returns the latest)
-                print("No backtest ID found, trying get_backtest_result…")
-                result2 = await session.call_tool("get_backtest_result", arguments={})
-                if result2.content and len(result2.content) > 0:
-                    text2 = result2.content[0].text
-                    print(f"Backtest result: {text2[:500]}")
-                    return extract_sharpe(text2)
-                return 0.0
+        # Check for error
+        if "error" in text.lower():
+            print(f"Create strategy failed: {text[:200]}")
+            return 0.0
 
-            # Step 2: Poll for the result
-            print(f"Polling for backtest {backtest_id}…")
-            for attempt in range(10):
-                await asyncio.sleep(2)
-                result2 = await session.call_tool(
-                    "get_backtest_result",
-                    arguments={"backtest_id": backtest_id}
-                )
-                if result2.content and len(result2.content) > 0:
-                    text2 = result2.content[0].text
-                    if "USER HINT" in text2:
-                        # Still running or returned the hint again
-                        continue
-                    if "error" in text2.lower():
-                        print(f"Backtest error: {text2[:300]}")
-                        return 0.0
-                    print(f"Backtest result: {text2[:500]}")
-                    return extract_sharpe(text2)
+        # Extract strategy ID
+        strategy_id = None
+        try:
+            data = json.loads(text)
+            strategy_id = data.get("id") or data.get("strategyId") or data.get("strategy_id")
+        except:
+            pass
+        if not strategy_id:
+            # Try to find any ID-like field
+            match = re.search(r'"id"\s*:\s*"([^"]+)"', text)
+            if match:
+                strategy_id = match.group(1)
+        if not strategy_id:
+            print("Could not extract strategy ID.")
+            return 0.0
 
-            print("Backtest timed out.")
-        return 0.0
+        print(f"Strategy ID: {strategy_id}")
     except Exception as e:
-        print(f"Backtest error: {e}")
+        print(f"Create strategy error: {e}")
         return 0.0
+
+    # Step 2: Run backtest
+    print(f"Running backtest for {strategy_id}…")
+    try:
+        result = await session.call_tool(
+            "run_backtest",
+            arguments={"strategyId": strategy_id}
+        )
+        if not result.content or len(result.content) == 0:
+            print("Run backtest returned empty.")
+            return 0.0
+
+        text = result.content[0].text
+        print(f"Run backtest response: {text[:300]}")
+
+        if "error" in text.lower():
+            print(f"Run backtest failed: {text[:200]}")
+            return 0.0
+
+        # Extract job ID
+        job_id = None
+        try:
+            data = json.loads(text)
+            job_id = data.get("jobId") or data.get("id") or data.get("job_id")
+        except:
+            pass
+        if not job_id:
+            match = re.search(r'"jobId"\s*:\s*"([^"]+)"', text)
+            if match:
+                job_id = match.group(1)
+        if not job_id:
+            print("Could not extract job ID, trying to get result directly…")
+            # Some APIs return the result immediately
+            return extract_sharpe(text)
+
+        print(f"Job ID: {job_id}")
+    except Exception as e:
+        print(f"Run backtest error: {e}")
+        return 0.0
+
+    # Step 3: Poll for result
+    print(f"Polling for result of job {job_id}…")
+    for attempt in range(15):
+        await asyncio.sleep(2)
+        try:
+            result = await session.call_tool(
+                "get_backtest_result",
+                arguments={"jobId": job_id}
+            )
+            if result.content and len(result.content) > 0:
+                text = result.content[0].text
+                if "USER HINT" in text or "pending" in text.lower() or "running" in text.lower():
+                    print(f"  Attempt {attempt+1}: still running…")
+                    continue
+                if "error" in text.lower():
+                    print(f"Backtest error: {text[:300]}")
+                    return 0.0
+                print(f"Result: {text[:400]}")
+                return extract_sharpe(text)
+        except Exception as e:
+            print(f"Poll error: {e}")
+    print("Backtest timed out.")
+    return 0.0
 
 # ---------- Gist helpers ----------
 GIST_HEADERS = {
@@ -272,7 +304,7 @@ async def main():
                 "4. Use standard indicators: ta.sma, ta.rsi, ta.macd, ta.ema.\n"
                 "5. Output ONLY the code, no markdown, no explanations."
             )
-            user = f"Write a Pine Script v6 strategy for EURUSD 1h."
+            user = f"Write a Pine Script v6 strategy for {INSTRUMENT} {TIMEFRAME}."
 
             response = deepseek_chat(user, system)
             if not response:
@@ -283,7 +315,7 @@ async def main():
 
             for i in range(2):
                 print(f"\nIteration {i+1}: Testing strategy…")
-                sharpe = await run_and_get_backtest(session, current_pine, INSTRUMENT, TIMEFRAME)
+                sharpe = await create_and_backtest(session, current_pine, INSTRUMENT, TIMEFRAME)
                 print(f"  Sharpe = {sharpe:.3f}")
 
                 if sharpe > best_sharpe:
@@ -301,7 +333,7 @@ async def main():
 
                 if i < 1:
                     prompt = (
-                        f"Pine Script achieved Sharpe={sharpe:.3f}. Improve it. Return ONLY improved Pine Script v6 code.\n\n"
+                        f"Pine Script achieved Sharpe={sharpe:.3f}. Improve it. Return ONLY improved v6 code.\n\n"
                         f"Current:\n{current_pine}"
                     )
                     response = deepseek_chat(prompt, system)
