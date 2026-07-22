@@ -432,13 +432,14 @@ async def startup_event():
         f"Watch list: {', '.join(CURRENT_WATCHLIST)}"
     )
 
+@app.get("/")
+@app.head("/")
+def root():
+    return {"message": "Trading bot is running. Use /health for status."}
+
 @app.get("/health")
 def health():
     return {"status": "ok", "best_sharpe": llm_strategy_optimizer.best_sharpe, "watch_list": CURRENT_WATCHLIST}
-
-@app.get("/")
-def root():
-    return {"message": "Trading bot is running. Use /health for status."}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
