@@ -5,7 +5,7 @@ Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + Trader.dev
 - SL/TP validated on correct side of market
 - Live news from Google News RSS, analysed by DeepSeek
 - Order status correctly checked (FILL / CANCELLED / REJECTED)
-- Robust MCP tool detection & strategy creation fallback
+- MCP backtest via quick_backtest (corrected argument names)
 - Live dashboard at /dashboard
 """
 import os, json, time, logging, threading, asyncio
@@ -386,126 +386,13 @@ def tg_send_sync(text):
     else:
         asyncio.ensure_future(send_telegram_message(text))
 
-# ---------- LLM-Driven Strategy Optimizer (with create/backtest logic) ----------
+# ---------- LLM-Driven Strategy Optimizer (using quick_backtest) ----------
 class LLMStrategyOptimizer:
     def __init__(self):
         self.best_strategy = None
         self.best_sharpe = -9999
-        # Cache tool capabilities
-        self.has_create_strategy = False
-        self.has_backtest_strategy = False
-        self.has_list_strategies = False
 
-    async def _discover_tools(self, session) -> List[str]:
-        """Returns a flat list of tool names, and sets capability flags."""
-        tools_data = await session.list_tools()
-        tool_names = []
-
-        def _extract_names(obj):
-            if hasattr(obj, 'tools'):
-                _extract_names(obj.tools)
-                return
-            if isinstance(obj, list):
-                for item in obj:
-                    _extract_names(item)
-                return
-            if isinstance(obj, dict):
-                if 'tools' in obj:
-                    _extract_names(obj['tools'])
-                    return
-                if 'name' in obj:
-                    tool_names.append(obj['name'])
-                    return
-                for v in obj.values():
-                    _extract_names(v)
-                return
-            if hasattr(obj, 'name'):
-                tool_names.append(obj.name)
-                return
-            if isinstance(obj, str):
-                tool_names.append(obj)
-
-        _extract_names(tools_data)
-        log_interaction("optimization", "system", f"Discovered tool names: {tool_names}")
-
-        # Determine capabilities
-        self.has_create_strategy = any('create' in t.lower() and 'strategy' in t.lower() for t in tool_names)
-        self.has_backtest_strategy = any('backtest' in t.lower() for t in tool_names)
-        self.has_list_strategies = any('list' in t.lower() and 'strategy' in t.lower() for t in tool_names)
-
-        if MCP_BACKTEST_TOOL and MCP_BACKTEST_TOOL in tool_names:
-            # If a specific tool is set, we assume it's a backtest tool
-            self.has_backtest_strategy = True
-
-        return tool_names
-
-    async def _create_strategy(self, session, strategy_definition: dict) -> Optional[str]:
-        """Create a new strategy via MCP and return its ID."""
-        # Find the create strategy tool name
-        tools = await self._discover_tools(session)
-        create_tool = None
-        for name in tools:
-            if 'create' in name.lower() and 'strategy' in name.lower():
-                create_tool = name
-                break
-        if not create_tool:
-            log_interaction("optimization", "system", "No create_strategy tool found.")
-            return None
-
-        try:
-            result = await session.call_tool(create_tool, arguments={"strategy": strategy_definition})
-            if result.content and len(result.content) > 0:
-                # Expecting the created strategy ID as text or JSON
-                text = result.content[0].text
-                try:
-                    data = json.loads(text)
-                    strategy_id = data.get('id') or data.get('strategy_id') or text
-                except:
-                    strategy_id = text.strip()
-                log_interaction("optimization", "system", f"Created strategy ID: {strategy_id}")
-                return str(strategy_id)
-        except Exception as e:
-            log_interaction("optimization", "system", f"Create strategy failed: {e}")
-        return None
-
-    async def _backtest(self, session, strategy_id_or_definition, instrument, timeframe) -> float:
-        """Run backtest either by strategy ID or direct definition."""
-        # Choose backtest tool name
-        tools = await self._discover_tools(session)
-        backtest_tool = MCP_BACKTEST_TOOL
-        if not backtest_tool:
-            for name in tools:
-                if 'backtest' in name.lower():
-                    backtest_tool = name
-                    break
-        if not backtest_tool:
-            log_interaction("optimization", "system", "No backtest tool available.")
-            return 0.0
-
-        # If we have a strategy ID, pass it; otherwise pass definition
-        args = {"instrument": instrument, "timeframe": timeframe}
-        if isinstance(strategy_id_or_definition, str):
-            args["strategy_id"] = strategy_id_or_definition
-        else:
-            args["strategy"] = strategy_id_or_definition
-
-        try:
-            result = await session.call_tool(backtest_tool, arguments=args)
-            if result.content and len(result.content) > 0:
-                text = result.content[0].text
-                try:
-                    data = json.loads(text)
-                    sharpe = data.get("sharpe") or data.get("sharpe_ratio") or \
-                             data.get("performance", {}).get("sharpe") or 0.0
-                    return float(sharpe)
-                except:
-                    return float(text)
-            return 0.0
-        except Exception as e:
-            log_interaction("optimization", "system", f"Backtest error: {e}")
-            return 0.0
-
-    async def _call_mcp_backtest_wrapper(self, strategy: dict, instrument="EUR_USD", timeframe="H1") -> float:
+    async def _call_mcp_backtest(self, strategy: dict, instrument="EUR_USD", timeframe="H1") -> float:
         headers = {}
         if TRADERDEV_API_KEY:
             headers["Authorization"] = f"Bearer {TRADERDEV_API_KEY}"
@@ -514,20 +401,27 @@ class LLMStrategyOptimizer:
             async with sse_client(MCP_SERVER_URL, headers=headers) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
-                    await self._discover_tools(session)   # populate capabilities
 
-                    # If we can create strategies, do it; then backtest by ID
-                    if self.has_create_strategy:
-                        strategy_id = await self._create_strategy(session, strategy)
-                        if strategy_id:
-                            return await self._backtest(session, strategy_id, instrument, timeframe)
-                        else:
-                            # If creation failed, try direct backtest (maybe the tool accepts both)
-                            log_interaction("optimization", "system", "Creation failed; trying direct backtest.")
-                            return await self._backtest(session, strategy, instrument, timeframe)
-                    else:
-                        # No create tool, just backtest directly
-                        return await self._backtest(session, strategy, instrument, timeframe)
+                    # Directly call quick_backtest – it doesn’t require a strategy ID
+                    # We pass the strategy definition as JSON under "strategy", and the symbol/timeframe
+                    result = await session.call_tool(
+                        "quick_backtest",   # Use the dedicated quick‑backtest tool
+                        arguments={
+                            "symbol": instrument,
+                            "timeframe": timeframe,
+                            "strategy": strategy   # Assuming it accepts a JSON strategy definition
+                        }
+                    )
+                    if result.content and len(result.content) > 0:
+                        text = result.content[0].text
+                        try:
+                            data = json.loads(text)
+                            sharpe = data.get("sharpe") or data.get("sharpe_ratio") or \
+                                     data.get("performance", {}).get("sharpe") or 0.0
+                            return float(sharpe)
+                        except:
+                            return float(text)
+                    return 0.0
         except Exception as e:
             if hasattr(e, 'exceptions'):
                 for sub_exc in e.exceptions:
@@ -554,7 +448,7 @@ class LLMStrategyOptimizer:
             return
         for i in range(2):
             log_interaction("optimization", "system", f"Iteration {i+1}: Testing strategy...")
-            sharpe = await self._call_mcp_backtest_wrapper(current_strategy)
+            sharpe = await self._call_mcp_backtest(current_strategy)
             log_interaction("optimization", "system", f"Iteration {i+1} Sharpe = {sharpe:.3f}")
             if sharpe > self.best_sharpe:
                 self.best_sharpe = sharpe
