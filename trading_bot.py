@@ -40,7 +40,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("TradingBot")
 
 # ---------- Config from environment ----------
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")          # required
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 OANDA_API_KEY = os.getenv("OANDA_API_KEY")
 OANDA_ENV = os.getenv("OANDA_ENV", "practice")
@@ -242,7 +242,11 @@ class LLMStrategyOptimizer:
                         "timeframe": timeframe
                     }
                 )
-                return result.get("sharpe", 0.0)
+                # MCP returns a CallToolResult with a list of content items
+                if result.content and len(result.content) > 0:
+                    sharpe_str = result.content[0].text
+                    return float(sharpe_str)
+                return 0.0
 
     async def run_optimization_loop(self):
         system = (
@@ -296,7 +300,10 @@ class LLMStrategyOptimizer:
 llm_strategy_optimizer = LLMStrategyOptimizer()
 
 def mcp_optimization_runner():
-    asyncio.run(llm_strategy_optimizer.run_optimization_loop())
+    try:
+        asyncio.run(llm_strategy_optimizer.run_optimization_loop())
+    except Exception as e:
+        logger.error(f"Optimization loop failed: {e}")
 
 # ---------- Morning Analysis Job ----------
 def morning_analysis():
@@ -428,6 +435,10 @@ async def startup_event():
 @app.get("/health")
 def health():
     return {"status": "ok", "best_sharpe": llm_strategy_optimizer.best_sharpe, "watch_list": CURRENT_WATCHLIST}
+
+@app.get("/")
+def root():
+    return {"message": "Trading bot is running. Use /health for status."}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
