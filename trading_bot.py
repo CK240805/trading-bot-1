@@ -1,10 +1,11 @@
 """
 Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + Trader.dev MCP
-- Rate limiter: max 40 LLM calls per minute (waits or skips)
-- Cooldown on 429/503 as additional back‑off
+- Rate limiter: max 40 LLM calls per minute
+- Units sign enforced (SELL → negative, BUY → positive)
+- SL/TP validated on correct side of market
 - Live news from Google News RSS, analysed by DeepSeek
 - Order status correctly checked (FILL / CANCELLED / REJECTED)
-- Handles MCP tools as tuples
+- Robust MCP tool detection (handles nested 'tools' key)
 - Live dashboard at /dashboard
 """
 import os, json, time, logging, threading, asyncio
@@ -71,15 +72,13 @@ CURRENT_WATCHLIST: List[str] = []
 VALID_INSTRUMENTS: Dict[str, dict] = {}
 _STARTUP_MESSAGE_SENT = False
 
-# Rate limit cooldown (triggers on 429 and 503)
 LAST_RATE_LIMIT = 0
 RATE_LIMIT_COOLDOWN_SEC = 120
 
-# Rate limiter: max 40 calls per 60 seconds
 _llm_call_timestamps = deque()
 MAX_CALLS_PER_MINUTE = 40
-RATE_LIMIT_WINDOW = 60   # seconds
-RATE_LIMIT_WAIT_TIMEOUT = 5   # max seconds to wait before skipping
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_WAIT_TIMEOUT = 5
 
 DEFAULT_INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
 
@@ -112,32 +111,21 @@ def log_interaction(category: str, role: str, content: str):
 
 # ---------- Rate limiter helper ----------
 def _check_rate_limit() -> bool:
-    """
-    Ensure we don't exceed MAX_CALLS_PER_MINUTE LLM requests.
-    If the limit is reached, wait up to RATE_LIMIT_WAIT_TIMEOUT seconds for a slot.
-    Returns True if we can proceed, False if we should skip.
-    """
     global _llm_call_timestamps
     now = time.time()
-    # Remove timestamps older than the window
     while _llm_call_timestamps and _llm_call_timestamps[0] < now - RATE_LIMIT_WINDOW:
         _llm_call_timestamps.popleft()
-
     if len(_llm_call_timestamps) < MAX_CALLS_PER_MINUTE:
         _llm_call_timestamps.append(now)
         return True
-
-    # We're at the limit; wait until the oldest call expires
     oldest = _llm_call_timestamps[0]
     wait_time = oldest + RATE_LIMIT_WINDOW - now
     if wait_time > RATE_LIMIT_WAIT_TIMEOUT:
         logger.warning("Rate limit reached, skipping LLM call (wait too long).")
         return False
-
     logger.info(f"Rate limit reached, waiting {wait_time:.1f}s...")
     time.sleep(wait_time)
-    # After waiting, try again (now oldest should be removed)
-    _llm_call_timestamps.popleft()   # remove the oldest
+    _llm_call_timestamps.popleft()
     _llm_call_timestamps.append(time.time())
     return True
 
@@ -149,19 +137,14 @@ def deepseek_chat(prompt: str, system: str = "", category: str = "general") -> s
         logger.warning("LLM call skipped – rate limit cooldown active.")
         log_interaction(category, "system", "LLM call blocked by cooldown.")
         return ""
-
-    # Rate limiter check
     if not _check_rate_limit():
         log_interaction(category, "system", "LLM call skipped due to rate limit.")
         return ""
-
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-
     log_interaction(category, "bot", prompt)
-
     try:
         completion = llm_client.chat.completions.create(
             model=LLM_MODEL,
@@ -187,7 +170,6 @@ def fetch_raw_headlines() -> str:
     now = time.time()
     if _last_raw_headlines and (now - _last_raw_headlines_time) < RAW_NEWS_MAX_AGE_SEC:
         return _last_raw_headlines
-
     try:
         resp = requests.get(GOOGLE_NEWS_RSS_URL, timeout=10)
         resp.raise_for_status()
@@ -198,12 +180,10 @@ def fetch_raw_headlines() -> str:
             if title_elem is not None and title_elem.text:
                 headlines.append(f"- {title_elem.text.strip()}")
         if not headlines:
-            logger.warning("Google News RSS returned no headlines.")
             return ""
         raw = "\n".join(headlines[:10])
         _last_raw_headlines = raw
         _last_raw_headlines_time = now
-        logger.info(f"Fetched {len(headlines[:10])} headlines from Google News.")
         return raw
     except Exception as e:
         logger.error(f"Failed to fetch Google News: {e}")
@@ -213,14 +193,11 @@ def fetch_raw_headlines() -> str:
 def get_news_briefing(force: bool = False) -> str:
     global _last_news_briefing, _last_news_briefing_time
     now = time.time()
-
     if not force and _last_news_briefing and (now - _last_news_briefing_time) < NEWS_BRIEFING_MAX_AGE_SEC:
         return _last_news_briefing
-
     raw_headlines = fetch_raw_headlines()
     if not raw_headlines:
         return _last_news_briefing if _last_news_briefing else ""
-
     system = (
         "You are a senior financial news analyst. Based on the headlines below, provide a concise "
         "market briefing for a trader. Highlight key events, market sentiment, and potential impact on "
@@ -262,14 +239,12 @@ def update_valid_instruments():
 def update_watch_list() -> List[str]:
     if not VALID_INSTRUMENTS:
         update_valid_instruments()
-
     news_briefing = get_news_briefing(force=True)
     system = "Select 5 OANDA instruments. Return ONLY a JSON array: ['EUR_USD','XAU_USD']"
     prompt = f"Market briefing:\n{news_briefing}\n\nTime: {datetime.now().isoformat()}\nProvide JSON array." if news_briefing else f"Time: {datetime.now().isoformat()}\nProvide JSON array."
     response = deepseek_chat(prompt, system, category="watchlist")
     if not response:
         return _filtered_default_watchlist()
-
     try:
         if "```" in response:
             response = response.split("```")[1].replace("json", "")
@@ -327,16 +302,38 @@ def adjust_units_to_instrument(instrument: str, desired_units: int, price: float
         abs_units = min_u
     return abs_units if desired_units >= 0 else -abs_units
 
+def validate_sl_tp(direction: str, entry_price: float, sl: Optional[float], tp: Optional[float]) -> tuple:
+    BUFFER = 0.0001
+    new_sl = sl
+    new_tp = tp
+    if direction == "BUY":
+        if sl is not None and sl >= entry_price - BUFFER:
+            new_sl = None
+        if tp is not None and tp <= entry_price + BUFFER:
+            new_tp = None
+    elif direction == "SELL":
+        if sl is not None and sl <= entry_price + BUFFER:
+            new_sl = None
+        if tp is not None and tp >= entry_price - BUFFER:
+            new_tp = None
+    return new_sl, new_tp
+
 def oanda_place_order(instrument, units, sl=None, tp=None):
+    direction = "BUY" if units > 0 else "SELL"
+    prices = oanda_get_prices([instrument])
+    if instrument in prices:
+        entry = (prices[instrument]["bid"] + prices[instrument]["ask"]) / 2
+    else:
+        entry = 0.0
+    sl, tp = validate_sl_tp(direction, entry, sl, tp)
     data = {"order": {
         "type": "MARKET", "instrument": instrument,
         "units": str(units), "timeInForce": "FOK"
     }}
-    if sl:
+    if sl is not None:
         data["order"]["stopLossOnFill"] = {"price": str(round(sl, 5))}
-    if tp:
+    if tp is not None:
         data["order"]["takeProfitOnFill"] = {"price": str(round(tp, 5))}
-
     try:
         resp = oanda_api.request(orders.OrderCreate(accountID=OANDA_ACCOUNT_ID, data=data))
         if "orderFillTransaction" in resp:
@@ -396,36 +393,48 @@ class LLMStrategyOptimizer:
         self.best_sharpe = -9999
 
     async def _find_backtest_tool(self, session) -> str:
-        tools = await session.list_tools()
+        tools_data = await session.list_tools()
+        log_interaction("optimization", "system", f"Raw tools type: {type(tools_data)} – content: {tools_data}")
+
         tool_names = []
-        for t in tools:
-            if hasattr(t, 'name'):
-                tool_names.append(t.name)
-            elif isinstance(t, (tuple, list)) and len(t) > 0:
-                tool_names.append(str(t[0]))
-            elif isinstance(t, dict) and 'name' in t:
-                tool_names.append(t['name'])
-            else:
-                tool_names.append(str(t))
-        log_interaction("optimization", "system", f"Available MCP tools: {tool_names}")
+
+        def _extract_names(obj):
+            if isinstance(obj, list):
+                for item in obj:
+                    _extract_names(item)
+            elif isinstance(obj, dict):
+                # If there's a 'tools' key, that's likely the list of tools
+                if 'tools' in obj:
+                    _extract_names(obj['tools'])
+                elif 'name' in obj:
+                    tool_names.append(obj['name'])
+            elif hasattr(obj, 'name'):
+                tool_names.append(obj.name)
+            elif isinstance(obj, str):
+                # Sometimes the server returns tool names as plain strings
+                tool_names.append(obj)
+
+        _extract_names(tools_data)
+
+        log_interaction("optimization", "system", f"All tool names found: {tool_names}")
+
         if MCP_BACKTEST_TOOL:
             if MCP_BACKTEST_TOOL in tool_names:
                 return MCP_BACKTEST_TOOL
-            else:
-                log_interaction("optimization", "system", f"Specified tool '{MCP_BACKTEST_TOOL}' not found.")
-                return None
+            log_interaction("optimization", "system", f"Specified tool '{MCP_BACKTEST_TOOL}' not in {tool_names}")
+            return None
+
         for name in tool_names:
-            if "backtest" in name.lower():
+            if 'backtest' in name.lower():
                 log_interaction("optimization", "system", f"Auto-selected backtest tool: {name}")
                 return name
-        log_interaction("optimization", "system", "No backtest tool found.")
+        log_interaction("optimization", "system", "No backtest tool found in tools list.")
         return None
 
     async def _call_mcp_backtest(self, strategy: dict, instrument="EUR_USD", timeframe="H1") -> float:
         headers = {}
         if TRADERDEV_API_KEY:
             headers["Authorization"] = f"Bearer {TRADERDEV_API_KEY}"
-
         try:
             async with sse_client(MCP_SERVER_URL, headers=headers) as (read, write):
                 async with ClientSession(read, write) as session:
@@ -433,7 +442,6 @@ class LLMStrategyOptimizer:
                     tool_name = await self._find_backtest_tool(session)
                     if not tool_name:
                         return 0.0
-
                     result = await session.call_tool(
                         tool_name,
                         arguments={
@@ -476,20 +484,16 @@ class LLMStrategyOptimizer:
             current_strategy = json.loads(response)
         except:
             return
-
-        # Only 2 iterations (1 initial, 1 improvement)
         for i in range(2):
             log_interaction("optimization", "system", f"Iteration {i+1}: Testing strategy...")
             sharpe = await self._call_mcp_backtest(current_strategy)
             log_interaction("optimization", "system", f"Iteration {i+1} Sharpe = {sharpe:.3f}")
-
             if sharpe > self.best_sharpe:
                 self.best_sharpe = sharpe
                 self.best_strategy = current_strategy
                 if sharpe >= 2.0:
                     log_interaction("optimization", "system", "🎉 Amazing strategy found!")
                     break
-
             improvement_prompt = (
                 f"The last strategy (Sharpe {sharpe:.3f}) was: {json.dumps(current_strategy)}. "
                 "Propose an improved version. Only JSON."
@@ -552,6 +556,7 @@ def trading_decision():
         news_block = f"\nMarket news briefing:\n{news_briefing}" if news_briefing else ""
         system = f"""You are a trading bot. Trade only: {', '.join(CURRENT_WATCHLIST)}.
 Return JSON: {{"action":"BUY"|"SELL"|"HOLD","instrument":"...","units":1000,"stop_loss":...,"take_profit":...,"timeframe":"M5"}}.
+For BUY, units must be POSITIVE. For SELL, units must be NEGATIVE (e.g., -1000).
 Exposure ≤ $100. If HOLD, other fields null."""
         user = f"Time: {datetime.now().isoformat()}\nPrices: {json.dumps(prices)}\nOpen: {json.dumps(open_trades)}{news_block}\nAction?"
         response = deepseek_chat(user, system, category="trade")
@@ -565,11 +570,19 @@ Exposure ≤ $100. If HOLD, other fields null."""
         if decision.get("action") == "HOLD":
             log_interaction("trade", "system", "AI decided HOLD.")
             return
+        action = decision.get("action")
         instrument = decision.get("instrument")
         units = decision.get("units", 0)
         if instrument not in CURRENT_WATCHLIST or units == 0:
             log_interaction("trade", "system", f"Invalid trade: {instrument} / {units}")
             return
+
+        # Enforce sign based on action
+        if action == "SELL" and units > 0:
+            units = -abs(units)
+        elif action == "BUY" and units < 0:
+            units = abs(units)
+
         price = (prices[instrument]["bid"] + prices[instrument]["ask"]) / 2
         valid_units = adjust_units_to_instrument(instrument, units, price)
         if valid_units == 0:
@@ -592,7 +605,7 @@ def run_scheduler():
     schedule.every(5).minutes.do(mcp_optimization_runner)
     schedule.every().day.at("07:00").do(morning_analysis)
     schedule.every().day.at("21:00").do(night_performance)
-    schedule.every(1).minutes.do(trading_decision)   # 1 call/min → 60/hr, well within 40/min
+    schedule.every(1).minutes.do(trading_decision)
     schedule.every(4).hours.do(refresh_watch_list_job)
     schedule.every(12).hours.do(refresh_instruments_job)
 
