@@ -1,9 +1,9 @@
 """
 Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + Trader.dev MCP
-- LLM cooldown only on 429 errors (no unnecessary blocking)
-- Live dashboard showing AI ↔ bot dialogues at /dashboard
-- Watch list validated against OANDA instruments
-- Trade size auto‑adjusted to instrument minimums and $100 cap
+- Uses configurable LLM_MODEL (default: deepseek-ai/deepseek-v4-flash)
+- No unsupported extra_body params
+- LLM cooldown only on 429 errors
+- Live dashboard at /dashboard
 """
 import os, json, time, logging, threading, asyncio
 from datetime import datetime
@@ -31,7 +31,6 @@ from mcp.client.sse import sse_client
 # NVIDIA LLM client
 from openai import OpenAI
 
-# Load .env locally
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -48,7 +47,7 @@ OANDA_API_KEY = os.getenv("OANDA_API_KEY")
 OANDA_ENV = os.getenv("OANDA_ENV", "practice")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-ai/deepseek-v4")
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-ai/deepseek-v4-flash")   # 🆕 working model
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://mcp.trader.dev/sse")
 MCP_BACKTEST_TOOL = os.getenv("MCP_BACKTEST_TOOL")   # optional
 ALLOCATED_CAPITAL = 100.0
@@ -71,24 +70,21 @@ RATE_LIMIT_COOLDOWN_SEC = 120
 
 DEFAULT_INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
 
-# ---------- Interaction log for dashboard ----------
-INTERACTION_LOG = deque(maxlen=200)   # keep last 200 events
+# ---------- Interaction log ----------
+INTERACTION_LOG = deque(maxlen=200)
 
 def log_interaction(category: str, role: str, content: str):
-    """Add a timestamped entry to the interaction log."""
     entry = {
         "time": datetime.utcnow().isoformat() + "Z",
-        "category": category,   # e.g. "trade", "optimization", "watchlist", "error"
-        "role": role,           # "bot" or "ai"
+        "category": category,
+        "role": role,
         "content": content
     }
     INTERACTION_LOG.append(entry)
-    # Also log to console (optional, can be limited)
     logger.info(f"[{category}] {role}: {content[:200]}")
 
-# ---------- Rate-limited LLM call ----------
+# ---------- LLM call (no extra_body) ----------
 def deepseek_chat(prompt: str, system: str = "", category: str = "general") -> str:
-    """Call the LLM. Cooldown only if we recently hit a 429."""
     global LAST_429_TIME
     now = time.time()
     if now - LAST_429_TIME < RATE_LIMIT_COOLDOWN_SEC:
@@ -101,7 +97,6 @@ def deepseek_chat(prompt: str, system: str = "", category: str = "general") -> s
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    # Log the prompt we are sending
     log_interaction(category, "bot", prompt)
 
     try:
@@ -111,7 +106,7 @@ def deepseek_chat(prompt: str, system: str = "", category: str = "general") -> s
             temperature=1,
             top_p=0.95,
             max_tokens=16384,
-            extra_body={"chat_template_kwargs": {"thinking": False}},
+            # ❌ removed extra_body to avoid 404 on models that don't support it
             stream=False
         )
         response = completion.choices[0].message.content
@@ -121,7 +116,7 @@ def deepseek_chat(prompt: str, system: str = "", category: str = "general") -> s
         logger.error(f"LLM API error: {e}")
         log_interaction("error", "system", f"LLM error: {e}")
         if "429" in str(e):
-            LAST_429_TIME = time.time()   # start cooldown
+            LAST_429_TIME = time.time()
         return ""
 
 # ---------- News ----------
@@ -137,7 +132,7 @@ def fetch_news() -> str:
     except:
         return "News fetch error."
 
-# ---------- Instrument fetching ----------
+# ---------- OANDA instruments ----------
 def get_valid_instruments() -> Dict[str, dict]:
     try:
         r = accounts.AccountInstruments(accountID=OANDA_ACCOUNT_ID)
@@ -179,7 +174,6 @@ def update_watch_list() -> List[str]:
         if isinstance(watchlist, list):
             valid = [i for i in watchlist if i in VALID_INSTRUMENTS]
             if len(valid) < 3:
-                log_interaction("watchlist", "system", f"Too few valid instruments, fallback to default.")
                 return _filtered_default_watchlist()
             while len(valid) < 5:
                 for d in DEFAULT_INSTRUMENTS:
@@ -188,11 +182,9 @@ def update_watch_list() -> List[str]:
                         if len(valid) >= 5:
                             break
             logger.info(f"Watch list: {valid}")
-            log_interaction("watchlist", "system", f"Final watch list: {valid}")
             return valid[:5]
     except:
         pass
-    log_interaction("watchlist", "system", "Parse error, using default watch list.")
     return _filtered_default_watchlist()
 
 def _filtered_default_watchlist():
@@ -276,7 +268,7 @@ def tg_send_sync(text):
     else:
         asyncio.ensure_future(send_telegram_message(text))
 
-# ---------- LLM-Driven Strategy Optimizer (remote Trader.dev MCP via SSE) ----------
+# ---------- LLM-Driven Strategy Optimizer ----------
 class LLMStrategyOptimizer:
     def __init__(self):
         self.best_strategy = None
@@ -343,7 +335,6 @@ class LLMStrategyOptimizer:
         try:
             current_strategy = json.loads(response)
         except:
-            log_interaction("optimization", "system", "Failed to parse initial strategy JSON.")
             return
 
         for i in range(5):
@@ -378,9 +369,8 @@ def mcp_optimization_runner():
         asyncio.run(llm_strategy_optimizer.run_optimization_loop())
     except Exception as e:
         logger.error(f"Optimization loop error: {e}")
-        log_interaction("optimization", "system", f"Loop crashed: {e}")
 
-# ---------- Jobs ----------
+# ---------- Scheduled Jobs ----------
 def morning_analysis():
     global CURRENT_WATCHLIST
     CURRENT_WATCHLIST = update_watch_list()
@@ -445,7 +435,6 @@ Exposure ≤ $100. If HOLD, other fields null."""
         oanda_place_order(instrument, valid_units, decision.get("stop_loss"), decision.get("take_profit"))
     except Exception as e:
         logger.exception(f"Trade error: {e}")
-        log_interaction("trade", "system", f"Trade error: {e}")
 
 def refresh_watch_list_job():
     global CURRENT_WATCHLIST
@@ -471,7 +460,7 @@ def run_scheduler():
             logger.error(f"Scheduler error: {e}")
         time.sleep(1)
 
-# ---------- FastAPI App & Dashboard ----------
+# ---------- FastAPI & Dashboard ----------
 app = FastAPI()
 
 @app.on_event("startup")
@@ -495,12 +484,10 @@ def health():
 
 @app.get("/api/logs")
 def api_logs():
-    """Return recent interaction logs as JSON."""
     return list(INTERACTION_LOG)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    """Simple HTML page that auto‑refreshes the interaction log."""
     return """
     <!DOCTYPE html>
     <html>
