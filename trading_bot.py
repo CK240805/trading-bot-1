@@ -65,6 +65,9 @@ oanda_api = API(access_token=OANDA_API_KEY, environment=OANDA_ENV)
 DEFAULT_TIMEFRAME = "M5"
 CURRENT_WATCHLIST: List[str] = []
 
+# Duplicate Telegram startup message guard
+_STARTUP_MESSAGE_SENT = False
+
 # ---------- NVIDIA LLM Chat ----------
 def deepseek_chat(prompt: str, system: str = "") -> str:
     """Send a prompt to NVIDIA's DeepSeek model and return the text response."""
@@ -412,7 +415,10 @@ def run_scheduler():
     schedule.every(4).hours.do(refresh_watch_list_job)
 
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            logger.error(f"Unhandled exception in scheduler loop: {e}", exc_info=True)
         time.sleep(1)
 
 # ---------- FastAPI App ----------
@@ -420,17 +426,19 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def startup_event():
-    global CURRENT_WATCHLIST
+    global CURRENT_WATCHLIST, _STARTUP_MESSAGE_SENT
     try:
         CURRENT_WATCHLIST = update_watch_list()
     except Exception as e:
         logger.error(f"Initial watch list failed: {e}")
         CURRENT_WATCHLIST = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
     threading.Thread(target=run_scheduler, daemon=True).start()
-    await send_telegram_message(
-        f"🤖 Trading bot started. Allocated capital: $100.\n"
-        f"Watch list: {', '.join(CURRENT_WATCHLIST)}"
-    )
+    if not _STARTUP_MESSAGE_SENT:
+        await send_telegram_message(
+            f"🤖 Trading bot started. Allocated capital: $100.\n"
+            f"Watch list: {', '.join(CURRENT_WATCHLIST)}"
+        )
+        _STARTUP_MESSAGE_SENT = True
 
 @app.get("/")
 @app.head("/")
