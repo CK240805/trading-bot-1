@@ -1,10 +1,10 @@
 """
 Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + Trader.dev MCP
+- Rate limiter: max 40 LLM calls per minute (waits or skips)
+- Cooldown on 429/503 as additional back‑off
 - Live news from Google News RSS, analysed by DeepSeek
 - Order status correctly checked (FILL / CANCELLED / REJECTED)
-- News briefing cached for 30 min, raw headlines cached for 5 min
-- Handles MCP tools as tuples (fixes AttributeError)
-- LLM cooldown only on 429 errors
+- Handles MCP tools as tuples
 - Live dashboard at /dashboard
 """
 import os, json, time, logging, threading, asyncio
@@ -71,20 +71,26 @@ CURRENT_WATCHLIST: List[str] = []
 VALID_INSTRUMENTS: Dict[str, dict] = {}
 _STARTUP_MESSAGE_SENT = False
 
-# Rate limit: only block after a real 429
-LAST_429_TIME = 0
+# Rate limit cooldown (triggers on 429 and 503)
+LAST_RATE_LIMIT = 0
 RATE_LIMIT_COOLDOWN_SEC = 120
+
+# Rate limiter: max 40 calls per 60 seconds
+_llm_call_timestamps = deque()
+MAX_CALLS_PER_MINUTE = 40
+RATE_LIMIT_WINDOW = 60   # seconds
+RATE_LIMIT_WAIT_TIMEOUT = 5   # max seconds to wait before skipping
 
 DEFAULT_INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
 
 # ---------- News cache ----------
 _last_raw_headlines: str = ""
 _last_raw_headlines_time: float = 0.0
-RAW_NEWS_MAX_AGE_SEC = 300   # re-fetch raw headlines after 5 minutes
+RAW_NEWS_MAX_AGE_SEC = 300
 
 _last_news_briefing: str = ""
 _last_news_briefing_time: float = 0.0
-NEWS_BRIEFING_MAX_AGE_SEC = 1800   # re-analyse news after 30 minutes
+NEWS_BRIEFING_MAX_AGE_SEC = 1800
 
 GOOGLE_NEWS_RSS_URL = (
     "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx6TVdZU0FtVnVHZ0pWVXlnQVAB"
@@ -104,13 +110,49 @@ def log_interaction(category: str, role: str, content: str):
     INTERACTION_LOG.append(entry)
     logger.info(f"[{category}] {role}: {content[:200]}")
 
+# ---------- Rate limiter helper ----------
+def _check_rate_limit() -> bool:
+    """
+    Ensure we don't exceed MAX_CALLS_PER_MINUTE LLM requests.
+    If the limit is reached, wait up to RATE_LIMIT_WAIT_TIMEOUT seconds for a slot.
+    Returns True if we can proceed, False if we should skip.
+    """
+    global _llm_call_timestamps
+    now = time.time()
+    # Remove timestamps older than the window
+    while _llm_call_timestamps and _llm_call_timestamps[0] < now - RATE_LIMIT_WINDOW:
+        _llm_call_timestamps.popleft()
+
+    if len(_llm_call_timestamps) < MAX_CALLS_PER_MINUTE:
+        _llm_call_timestamps.append(now)
+        return True
+
+    # We're at the limit; wait until the oldest call expires
+    oldest = _llm_call_timestamps[0]
+    wait_time = oldest + RATE_LIMIT_WINDOW - now
+    if wait_time > RATE_LIMIT_WAIT_TIMEOUT:
+        logger.warning("Rate limit reached, skipping LLM call (wait too long).")
+        return False
+
+    logger.info(f"Rate limit reached, waiting {wait_time:.1f}s...")
+    time.sleep(wait_time)
+    # After waiting, try again (now oldest should be removed)
+    _llm_call_timestamps.popleft()   # remove the oldest
+    _llm_call_timestamps.append(time.time())
+    return True
+
 # ---------- LLM call ----------
 def deepseek_chat(prompt: str, system: str = "", category: str = "general") -> str:
-    global LAST_429_TIME
+    global LAST_RATE_LIMIT
     now = time.time()
-    if now - LAST_429_TIME < RATE_LIMIT_COOLDOWN_SEC:
-        logger.warning("LLM call skipped – rate limit cooldown active (429).")
-        log_interaction(category, "system", "LLM call blocked by rate-limit cooldown.")
+    if now - LAST_RATE_LIMIT < RATE_LIMIT_COOLDOWN_SEC:
+        logger.warning("LLM call skipped – rate limit cooldown active.")
+        log_interaction(category, "system", "LLM call blocked by cooldown.")
+        return ""
+
+    # Rate limiter check
+    if not _check_rate_limit():
+        log_interaction(category, "system", "LLM call skipped due to rate limit.")
         return ""
 
     messages = []
@@ -135,13 +177,12 @@ def deepseek_chat(prompt: str, system: str = "", category: str = "general") -> s
     except Exception as e:
         logger.error(f"LLM API error: {e}")
         log_interaction("error", "system", f"LLM error: {e}")
-        if "429" in str(e):
-            LAST_429_TIME = time.time()
+        if "429" in str(e) or "503" in str(e):
+            LAST_RATE_LIMIT = time.time()
         return ""
 
 # ---------- Fetch raw headlines from Google News RSS ----------
 def fetch_raw_headlines() -> str:
-    """Return a string of the latest business headlines from Google News RSS, or empty on failure."""
     global _last_raw_headlines, _last_raw_headlines_time
     now = time.time()
     if _last_raw_headlines and (now - _last_raw_headlines_time) < RAW_NEWS_MAX_AGE_SEC:
@@ -287,13 +328,9 @@ def adjust_units_to_instrument(instrument: str, desired_units: int, price: float
     return abs_units if desired_units >= 0 else -abs_units
 
 def oanda_place_order(instrument, units, sl=None, tp=None):
-    """
-    Place a market order and check the actual transaction status.
-    Returns the response only if the order was FILLED; otherwise logs the reason.
-    """
     data = {"order": {
         "type": "MARKET", "instrument": instrument,
-        "units": str(units), "timeInForce": "FOK"   # <-- change to "IOC" if you want partial fills
+        "units": str(units), "timeInForce": "FOK"
     }}
     if sl:
         data["order"]["stopLossOnFill"] = {"price": str(round(sl, 5))}
@@ -302,11 +339,6 @@ def oanda_place_order(instrument, units, sl=None, tp=None):
 
     try:
         resp = oanda_api.request(orders.OrderCreate(accountID=OANDA_ACCOUNT_ID, data=data))
-
-        # The response contains either:
-        #   "orderFillTransaction"   -> filled
-        #   "orderCancelTransaction" -> cancelled (e.g., FOK couldn't fill)
-        #   "orderRejectTransaction" -> rejected (e.g., invalid size)
         if "orderFillTransaction" in resp:
             logger.info(f"✅ Order FILLED: {instrument} {units} units")
             log_interaction("trade", "system", f"✅ Order FILLED: {instrument} {units} units")
@@ -324,7 +356,6 @@ def oanda_place_order(instrument, units, sl=None, tp=None):
             log_interaction("trade", "system", msg)
             tg_send_sync(msg)
         else:
-            # unexpected format
             logger.info(f"Order response: {resp}")
             log_interaction("trade", "system", f"Unknown order response: {resp}")
         return None
@@ -446,7 +477,8 @@ class LLMStrategyOptimizer:
         except:
             return
 
-        for i in range(5):
+        # Only 2 iterations (1 initial, 1 improvement)
+        for i in range(2):
             log_interaction("optimization", "system", f"Iteration {i+1}: Testing strategy...")
             sharpe = await self._call_mcp_backtest(current_strategy)
             log_interaction("optimization", "system", f"Iteration {i+1} Sharpe = {sharpe:.3f}")
@@ -560,7 +592,7 @@ def run_scheduler():
     schedule.every(5).minutes.do(mcp_optimization_runner)
     schedule.every().day.at("07:00").do(morning_analysis)
     schedule.every().day.at("21:00").do(night_performance)
-    schedule.every(1).minutes.do(trading_decision)
+    schedule.every(1).minutes.do(trading_decision)   # 1 call/min → 60/hr, well within 40/min
     schedule.every(4).hours.do(refresh_watch_list_job)
     schedule.every(12).hours.do(refresh_instruments_job)
 
