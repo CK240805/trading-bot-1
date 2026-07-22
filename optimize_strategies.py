@@ -1,6 +1,6 @@
 """
 Pre‑trading strategy optimization – DeepSeek + Trader.dev MCP
-Creates strategy, runs backtest, extracts Sharpe (inline or via polling).
+Creates strategy, runs backtest, extracts Sharpe from inline result.
 Saves the best strategy to a GitHub Gist.
 """
 import os, json, time, asyncio, requests, re
@@ -75,7 +75,6 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
 
 # ---------- Pine Script helpers ----------
 def clean_pine_code(code: str) -> str:
-    """Remove markdown fences, ensure version 6, fix settings."""
     if "```" in code:
         parts = code.split("```")
         for part in parts:
@@ -99,27 +98,29 @@ def generate_strategy_name() -> str:
     return f"opt-{int(time.time())}"
 
 # ---------- Sharpe extraction ----------
-def extract_sharpe(text: str) -> float:
-    """Deep search for Sharpe ratio in any JSON structure."""
+def extract_sharpe(obj, depth=0):
+    """Recursively find any Sharpe-related value in a dict/list."""
+    if depth > 10 or obj is None:
+        return None
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if "sharpe" in k.lower() and isinstance(v, (int, float)):
+                return float(v)
+            r = extract_sharpe(v, depth + 1)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for item in obj:
+            r = extract_sharpe(item, depth + 1)
+            if r is not None:
+                return r
+    return None
+
+def get_sharpe_from_text(text: str) -> float:
+    """Extract Sharpe from a JSON string."""
     try:
         data = json.loads(text)
-        def find(obj, depth=0):
-            if depth > 8:
-                return None
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    if "sharpe" in k.lower() and isinstance(v, (int, float)):
-                        return float(v)
-                    r = find(v, depth + 1)
-                    if r is not None:
-                        return r
-            elif isinstance(obj, list):
-                for item in obj:
-                    r = find(item, depth + 1)
-                    if r is not None:
-                        return r
-            return None
-        val = find(data)
+        val = extract_sharpe(data)
         if val is not None:
             return val
     except:
@@ -131,7 +132,6 @@ def extract_sharpe(text: str) -> float:
 
 # ---------- Full backtest workflow ----------
 async def create_and_backtest(session, pine_code: str, symbol: str, timeframe: str) -> float:
-    """Create strategy, run backtest, extract Sharpe."""
     pine_code = clean_pine_code(pine_code)
     strategy_name = generate_strategy_name()
 
@@ -152,7 +152,7 @@ async def create_and_backtest(session, pine_code: str, symbol: str, timeframe: s
     strategy_id = data.get("id")
     print(f"Strategy ID: {strategy_id}")
 
-    # Step 2: Run backtest
+    # Step 2: Run backtest (result is inline)
     print("Running backtest…")
     result = await session.call_tool("run_backtest", arguments={"strategyId": strategy_id})
     if not result.content:
@@ -162,58 +162,41 @@ async def create_and_backtest(session, pine_code: str, symbol: str, timeframe: s
         print(f"Backtest error: {text[:300]}")
         return 0.0
 
+    # Parse the full response
     data = json.loads(text)
-    print(f"Backtest response keys: {list(data.keys())}")
 
-    # Try to extract Sharpe from the inline result first
-    sharpe = extract_sharpe(text)
-    if sharpe != 0.0:
-        print(f"Sharpe found inline: {sharpe:.3f}")
+    # First, try to find Sharpe in the entire response
+    sharpe = extract_sharpe(data)
+    if sharpe is not None and sharpe != 0.0:
+        print(f"✅ Sharpe found: {sharpe:.3f}")
         return sharpe
 
-    # If no Sharpe inline, get the jobId and poll
-    job_id = data.get("jobId")
-    if not job_id:
-        # Try nested result
-        result_obj = data.get("result", {})
-        if isinstance(result_obj, dict):
-            job_id = result_obj.get("jobId")
-            # Also try extracting Sharpe from the nested result
-            sharpe = extract_sharpe(json.dumps(result_obj))
-            if sharpe != 0.0:
-                print(f"Sharpe found in nested result: {sharpe:.3f}")
+    # If not found, print the 'result' key to debug
+    result_obj = data.get("result", {})
+    if isinstance(result_obj, dict):
+        print(f"Result keys: {list(result_obj.keys())}")
+        # Print a sample of what's inside result
+        for k, v in result_obj.items():
+            if not isinstance(v, (dict, list)):
+                print(f"  {k}: {v}")
+        # Try to find Sharpe in nested result
+        sharpe = extract_sharpe(result_obj)
+        if sharpe is not None and sharpe != 0.0:
+            print(f"✅ Sharpe found in result: {sharpe:.3f}")
+            return sharpe
+
+    # If still not found, print the full response for debugging
+    print("⚠️ No Sharpe found. Full response keys:")
+    print(list(data.keys()))
+    # Check if there's a 'metrics' or 'totals' key
+    for key in ["metrics", "totals", "statistics", "performance"]:
+        if key in data:
+            print(f"Found '{key}' key: {json.dumps(data[key])[:300]}")
+            sharpe = extract_sharpe(data[key])
+            if sharpe is not None and sharpe != 0.0:
+                print(f"✅ Sharpe found in {key}: {sharpe:.3f}")
                 return sharpe
 
-    if not job_id:
-        # Try resultId as fallback (some APIs use this)
-        job_id = data.get("resultId") or (data.get("result", {}).get("id") if isinstance(data.get("result"), dict) else None)
-
-    if not job_id:
-        print("No jobId or resultId found in response.")
-        return 0.0
-
-    print(f"Job ID: {job_id}")
-
-    # Step 3: Poll for result
-    for attempt in range(10):
-        await asyncio.sleep(3)
-        print(f"  Polling attempt {attempt+1}…")
-        result = await session.call_tool("get_backtest_result", arguments={"jobId": job_id})
-        if result.content:
-            text = result.content[0].text
-            if "not_found" in text.lower():
-                print("  Job not found, may have expired.")
-                return 0.0
-            if "error" in text.lower():
-                print(f"  Error: {text[:200]}")
-                continue
-            sharpe = extract_sharpe(text)
-            if sharpe != 0.0:
-                print(f"  Sharpe found: {sharpe:.3f}")
-                return sharpe
-            print(f"  Response: {text[:200]}")
-
-    print("Polling timed out.")
     return 0.0
 
 # ---------- Gist helpers ----------
