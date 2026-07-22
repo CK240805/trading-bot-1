@@ -3,7 +3,7 @@ Pre‑trading strategy optimization – DeepSeek + Trader.dev MCP
 Saves the best strategy and Sharpe ratio to a GitHub Gist.
 Run by GitHub Actions before trading starts.
 """
-import os, json, time, asyncio, requests
+import os, json, time, asyncio, requests, traceback
 from openai import OpenAI
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -31,30 +31,72 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
     )
     return resp.choices[0].message.content
 
-# ---------- MCP backtest ----------
+# ---------- MCP backtest (with detailed error logging) ----------
 async def backtest_strategy(strategy: dict, instrument="EUR_USD", timeframe="H1") -> float:
     headers = {}
     if TRADERDEV_API_KEY:
         headers["Authorization"] = f"Bearer {TRADERDEV_API_KEY}"
+
     try:
         async with sse_client(MCP_SERVER_URL, headers=headers) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                result = await session.call_tool(
-                    "quick_backtest",
-                    arguments={"symbol": instrument, "timeframe": timeframe, "strategy": strategy}
-                )
+
+                # First, list available tools to see what we have
+                tools = await session.list_tools()
+                tool_names = []
+                if hasattr(tools, 'tools'):
+                    tool_names = [t.name for t in tools.tools]
+                elif isinstance(tools, list):
+                    for t in tools:
+                        if hasattr(t, 'name'):
+                            tool_names.append(t.name)
+                print(f"Available tools: {tool_names}")
+
+                # Try quick_backtest first, fall back to run_backtest
+                backtest_tool = None
+                if "quick_backtest" in tool_names:
+                    backtest_tool = "quick_backtest"
+                elif "run_backtest" in tool_names:
+                    backtest_tool = "run_backtest"
+                else:
+                    print("❌ No backtest tool found!")
+                    return 0.0
+
+                print(f"Using tool: {backtest_tool}")
+
+                # Build arguments – try different formats
+                args = {"symbol": instrument, "timeframe": timeframe}
+                # Try passing strategy as JSON string or object
+                args["strategy"] = strategy  # some servers want the raw object
+
+                result = await session.call_tool(backtest_tool, arguments=args)
+
                 if result.content and len(result.content) > 0:
                     text = result.content[0].text
+                    print(f"Raw backtest response: {text[:500]}")
                     try:
                         data = json.loads(text)
-                        return float(data.get("sharpe") or data.get("sharpe_ratio") or
-                                      data.get("performance", {}).get("sharpe") or 0.0)
+                        sharpe = data.get("sharpe") or data.get("sharpe_ratio") or \
+                                 data.get("performance", {}).get("sharpe")
+                        if sharpe is not None:
+                            return float(sharpe)
                     except:
-                        return float(text)
+                        pass
+                    # Try parsing as plain number
+                    try:
+                        return float(text.strip())
+                    except:
+                        pass
                 return 0.0
     except Exception as e:
         print(f"Backtest error: {e}")
+        if hasattr(e, 'exceptions'):
+            for sub_exc in e.exceptions:
+                print(f"  Inner exception: {sub_exc}")
+                traceback.print_exception(type(sub_exc), sub_exc, sub_exc.__traceback__)
+        else:
+            traceback.print_exc()
         return 0.0
 
 # ---------- Gist helpers ----------
@@ -81,7 +123,7 @@ def create_gist(data: dict) -> str:
     """Create a new gist and return its ID."""
     payload = {
         "description": "Trading bot state",
-        "public": False,   # private gist
+        "public": False,
         "files": {"bot_state.json": {"content": json.dumps(data, indent=2)}}
     }
     resp = requests.post("https://api.github.com/gists", headers=GIST_HEADERS, json=payload)
@@ -92,7 +134,6 @@ def create_gist(data: dict) -> str:
 async def main():
     print("🚀 Starting strategy optimization…")
 
-    # Determine gist ID
     gist_id = GIST_ID
     if not gist_id:
         print("No GIST_ID set – creating a new gist…")
@@ -100,7 +141,6 @@ async def main():
         print(f"✅ Created gist: {gist_id}")
         print(f"👉 Add this to your GitHub Actions secrets: GIST_ID = {gist_id}")
 
-    # Load previous best (if any)
     try:
         state = read_gist(gist_id)
         best_strategy = state.get("best_strategy")
@@ -111,7 +151,6 @@ async def main():
         best_strategy = None
         best_sharpe = -9999
 
-    # Ask DeepSeek for an initial strategy
     system = (
         "You are a quant strategist. Output a JSON strategy object that Trader.dev can backtest. "
         "Example: {\"type\": \"sma_crossover\", \"fast_ma\": 10, \"slow_ma\": 30, \"stop_loss_pct\": 2}. "
@@ -128,7 +167,6 @@ async def main():
         print("❌ Could not parse strategy JSON.")
         return
 
-    # Optimization loop (up to 5 iterations)
     for i in range(5):
         print(f"Iteration {i+1}: Testing strategy…")
         sharpe = await backtest_strategy(current)
@@ -137,7 +175,6 @@ async def main():
         if sharpe > best_sharpe:
             best_sharpe = sharpe
             best_strategy = current
-            # Save to gist immediately
             write_gist(gist_id, {
                 "best_strategy": best_strategy,
                 "best_sharpe": best_sharpe,
@@ -148,7 +185,6 @@ async def main():
                 print("🎉 Amazing strategy found!")
                 break
 
-        # Ask for improvement
         prompt = f"The last strategy (Sharpe {sharpe:.3f}) was: {json.dumps(current)}. Propose an improved version. Only JSON."
         response = deepseek_chat(prompt, system)
         if not response:
