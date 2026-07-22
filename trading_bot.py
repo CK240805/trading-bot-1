@@ -1,6 +1,7 @@
 """
 Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + Trader.dev MCP
 - Live news from Google News RSS, analysed by DeepSeek
+- Order status correctly checked (FILL / CANCELLED / REJECTED)
 - News briefing cached for 30 min, raw headlines cached for 5 min
 - Handles MCP tools as tuples (fixes AttributeError)
 - LLM cooldown only on 429 errors
@@ -85,7 +86,6 @@ _last_news_briefing: str = ""
 _last_news_briefing_time: float = 0.0
 NEWS_BRIEFING_MAX_AGE_SEC = 1800   # re-analyse news after 30 minutes
 
-# Google News RSS URL (business news, US edition)
 GOOGLE_NEWS_RSS_URL = (
     "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx6TVdZU0FtVnVHZ0pWVXlnQVAB"
     "?hl=en-US&gl=US&ceid=US:en"
@@ -144,7 +144,6 @@ def fetch_raw_headlines() -> str:
     """Return a string of the latest business headlines from Google News RSS, or empty on failure."""
     global _last_raw_headlines, _last_raw_headlines_time
     now = time.time()
-    # Use cache if fresh enough
     if _last_raw_headlines and (now - _last_raw_headlines_time) < RAW_NEWS_MAX_AGE_SEC:
         return _last_raw_headlines
 
@@ -160,7 +159,7 @@ def fetch_raw_headlines() -> str:
         if not headlines:
             logger.warning("Google News RSS returned no headlines.")
             return ""
-        raw = "\n".join(headlines[:10])   # limit to 10 headlines
+        raw = "\n".join(headlines[:10])
         _last_raw_headlines = raw
         _last_raw_headlines_time = now
         logger.info(f"Fetched {len(headlines[:10])} headlines from Google News.")
@@ -169,24 +168,16 @@ def fetch_raw_headlines() -> str:
         logger.error(f"Failed to fetch Google News: {e}")
         return ""
 
-# ---------- Get market news briefing (raw headlines → DeepSeek analysis) ----------
+# ---------- Get market news briefing ----------
 def get_news_briefing(force: bool = False) -> str:
-    """
-    Fetch live headlines from Google News, then ask DeepSeek to analyse them
-    into a concise trader's briefing. The briefing is cached for 30 min.
-    If headlines can't be fetched, returns the last cached briefing if available,
-    otherwise an empty string.
-    """
     global _last_news_briefing, _last_news_briefing_time
     now = time.time()
 
-    # If briefing is still fresh and not forced, return cached
     if not force and _last_news_briefing and (now - _last_news_briefing_time) < NEWS_BRIEFING_MAX_AGE_SEC:
         return _last_news_briefing
 
     raw_headlines = fetch_raw_headlines()
     if not raw_headlines:
-        # Fallback: keep using last briefing if available, otherwise empty
         return _last_news_briefing if _last_news_briefing else ""
 
     system = (
@@ -201,7 +192,6 @@ def get_news_briefing(force: bool = False) -> str:
         _last_news_briefing_time = now
         return briefing
     else:
-        # If LLM fails, return raw headlines as a fallback
         return raw_headlines
 
 # ---------- OANDA instruments ----------
@@ -232,7 +222,7 @@ def update_watch_list() -> List[str]:
     if not VALID_INSTRUMENTS:
         update_valid_instruments()
 
-    news_briefing = get_news_briefing(force=True)   # always get fresh for watch list
+    news_briefing = get_news_briefing(force=True)
     system = "Select 5 OANDA instruments. Return ONLY a JSON array: ['EUR_USD','XAU_USD']"
     prompt = f"Market briefing:\n{news_briefing}\n\nTime: {datetime.now().isoformat()}\nProvide JSON array." if news_briefing else f"Time: {datetime.now().isoformat()}\nProvide JSON array."
     response = deepseek_chat(prompt, system, category="watchlist")
@@ -297,22 +287,50 @@ def adjust_units_to_instrument(instrument: str, desired_units: int, price: float
     return abs_units if desired_units >= 0 else -abs_units
 
 def oanda_place_order(instrument, units, sl=None, tp=None):
+    """
+    Place a market order and check the actual transaction status.
+    Returns the response only if the order was FILLED; otherwise logs the reason.
+    """
     data = {"order": {
         "type": "MARKET", "instrument": instrument,
-        "units": str(units), "timeInForce": "FOK"
+        "units": str(units), "timeInForce": "FOK"   # <-- change to "IOC" if you want partial fills
     }}
     if sl:
         data["order"]["stopLossOnFill"] = {"price": str(round(sl, 5))}
     if tp:
         data["order"]["takeProfitOnFill"] = {"price": str(round(tp, 5))}
+
     try:
         resp = oanda_api.request(orders.OrderCreate(accountID=OANDA_ACCOUNT_ID, data=data))
-        logger.info(f"Order placed: {resp}")
-        log_interaction("trade", "system", f"Order placed: {instrument} {units} units")
-        return resp
+
+        # The response contains either:
+        #   "orderFillTransaction"   -> filled
+        #   "orderCancelTransaction" -> cancelled (e.g., FOK couldn't fill)
+        #   "orderRejectTransaction" -> rejected (e.g., invalid size)
+        if "orderFillTransaction" in resp:
+            logger.info(f"✅ Order FILLED: {instrument} {units} units")
+            log_interaction("trade", "system", f"✅ Order FILLED: {instrument} {units} units")
+            return resp
+        elif "orderCancelTransaction" in resp:
+            reason = resp["orderCancelTransaction"].get("reason", "unknown")
+            msg = f"❌ Order CANCELLED: {instrument} {units} units. Reason: {reason}"
+            logger.warning(msg)
+            log_interaction("trade", "system", msg)
+            tg_send_sync(msg)
+        elif "orderRejectTransaction" in resp:
+            reason = resp["orderRejectTransaction"].get("reason", "unknown")
+            msg = f"❌ Order REJECTED: {instrument} {units} units. Reason: {reason}"
+            logger.warning(msg)
+            log_interaction("trade", "system", msg)
+            tg_send_sync(msg)
+        else:
+            # unexpected format
+            logger.info(f"Order response: {resp}")
+            log_interaction("trade", "system", f"Unknown order response: {resp}")
+        return None
     except Exception as e:
         logger.error(f"Order error: {e}")
-        log_interaction("trade", "system", f"Order failed: {e}")
+        log_interaction("trade", "system", f"Order error: {e}")
         return None
 
 def oanda_get_open_trades():
@@ -498,7 +516,7 @@ def trading_decision():
         if not prices:
             return
         open_trades = oanda_get_open_trades()
-        news_briefing = get_news_briefing()   # cached, only refreshes every 30 min (raw headlines every 5 min)
+        news_briefing = get_news_briefing()
         news_block = f"\nMarket news briefing:\n{news_briefing}" if news_briefing else ""
         system = f"""You are a trading bot. Trade only: {', '.join(CURRENT_WATCHLIST)}.
 Return JSON: {{"action":"BUY"|"SELL"|"HOLD","instrument":"...","units":1000,"stop_loss":...,"take_profit":...,"timeframe":"M5"}}.
