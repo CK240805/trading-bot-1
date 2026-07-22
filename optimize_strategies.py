@@ -1,9 +1,9 @@
 """
 Pre‑trading strategy optimization – DeepSeek + Trader.dev MCP
-Generates Pine Script strategies and backtests via quick_backtest.
+Generates Pine Script v6 strategies and backtests via quick_backtest.
 Saves the best strategy and Sharpe ratio to a GitHub Gist.
 """
-import os, json, time, asyncio, requests
+import os, json, time, asyncio, requests, re
 from collections import deque
 from openai import OpenAI
 from mcp import ClientSession
@@ -70,9 +70,18 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
             LAST_RATE_LIMIT = time.time()
         return ""
 
+# ---------- Pine Script helpers ----------
+def fix_pine_version(code: str) -> str:
+    """Ensure the Pine Script starts with //@version=6."""
+    # Replace any existing version directive
+    code = re.sub(r'//@version\s*=\s*\d+', '//@version=6', code, count=1)
+    # If no version directive at all, prepend it
+    if not code.startswith('//@version'):
+        code = '//@version=6\n' + code
+    return code
+
 # ---------- MCP helpers ----------
 async def get_pine_rules(session) -> str:
-    """Fetch Pine Script coding rules from Trader.dev."""
     try:
         result = await session.call_tool("get_pine_codegen_rules", arguments={})
         if result.content and len(result.content) > 0:
@@ -82,7 +91,8 @@ async def get_pine_rules(session) -> str:
     return ""
 
 async def backtest_pine_script(session, pine_code: str, instrument="EUR_USD", timeframe="H1") -> float:
-    """Run quick_backtest with Pine Script code."""
+    pine_code = fix_pine_version(pine_code)
+    print(f"First line of Pine: {pine_code.split(chr(10))[0]}")
     try:
         result = await session.call_tool(
             "quick_backtest",
@@ -95,6 +105,10 @@ async def backtest_pine_script(session, pine_code: str, instrument="EUR_USD", ti
         if result.content and len(result.content) > 0:
             text = result.content[0].text
             print(f"Raw backtest response: {text[:500]}")
+            # Check for errors
+            if "error" in text.lower() or "mcprule_rejected" in text.lower():
+                print(f"Backtest rejected: {text[:300]}")
+                return 0.0
             try:
                 data = json.loads(text)
                 sharpe = data.get("sharpe") or data.get("sharpe_ratio") or \
@@ -168,34 +182,35 @@ async def main():
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            # Get Pine Script rules so DeepSeek writes correct code
+            # Get Pine Script rules
             pine_rules = await get_pine_rules(session)
-            print(f"Pine rules: {pine_rules[:200]}…")
+            if pine_rules:
+                print(f"Pine rules received ({len(pine_rules)} chars)")
 
-            # Prompt for Pine Script
+            # Prompt for Pine Script v6
             system = (
-                "You are a Pine Script expert. Generate a complete, valid Pine Script v5 strategy "
-                "that can be backtested on Trader.dev. Include entry/exit rules, stop loss, and "
-                "take profit. Use standard indicators (SMA, RSI, MACD, etc.). "
-                "Output ONLY the Pine Script code, no explanations.\n"
-                f"Additional rules from Trader.dev:\n{pine_rules}"
+                "You are a Pine Script expert. Generate a COMPLETE Pine Script v6 strategy "
+                "that can be backtested. CRITICAL: the first line MUST be exactly:\n"
+                "//@version=6\n"
+                "Include entry/exit rules, stop loss, take profit. Use standard indicators. "
+                "Output ONLY the Pine Script code, no markdown fences, no explanations.\n"
+                f"Additional rules from the platform:\n{pine_rules}"
             )
-            user = "Write a complete Pine Script v5 strategy for EUR/USD H1."
+            user = "Write a complete Pine Script v6 strategy for EUR/USD H1 with entry/exit rules and risk management."
 
             response = deepseek_chat(user, system)
             if not response:
                 print("❌ LLM returned no strategy.")
                 return
 
-            # Extract Pine Script from response (remove markdown code fences if any)
+            # Clean up response
             if "```" in response:
                 response = response.split("```")[1]
-                if response.startswith("pine"):
+                if response.lower().startswith("pine"):
                     response = response[4:].strip()
-
             current_pine = response.strip()
 
-            for i in range(2):   # 2 iterations to save API calls
+            for i in range(2):
                 print(f"Iteration {i+1}: Testing strategy…")
                 sharpe = await backtest_pine_script(session, current_pine)
                 print(f"  Sharpe = {sharpe:.3f}")
@@ -213,20 +228,20 @@ async def main():
                         print("🎉 Amazing strategy found!")
                         break
 
-                # Improve
-                prompt = (
-                    f"The last Pine Script strategy achieved a Sharpe of {sharpe:.3f}. "
-                    f"Here is the code:\n{current_pine}\n\n"
-                    "Improve it. Return ONLY the improved Pine Script code."
-                )
-                response = deepseek_chat(prompt, system)
-                if not response:
-                    break
-                if "```" in response:
-                    response = response.split("```")[1]
-                    if response.startswith("pine"):
-                        response = response[4:].strip()
-                current_pine = response.strip()
+                if i < 1:  # Don't ask for improvement on the last iteration
+                    prompt = (
+                        f"The Pine Script below achieved a Sharpe of {sharpe:.3f}. "
+                        f"Improve it to get a higher Sharpe. Return ONLY the improved Pine Script v6 code.\n\n"
+                        f"Current code:\n{current_pine}"
+                    )
+                    response = deepseek_chat(prompt, system)
+                    if not response:
+                        break
+                    if "```" in response:
+                        response = response.split("```")[1]
+                        if response.lower().startswith("pine"):
+                            response = response[4:].strip()
+                    current_pine = response.strip()
 
     print(f"🏁 Optimization finished. Best Sharpe: {best_sharpe:.3f}")
 
