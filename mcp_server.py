@@ -36,7 +36,6 @@ async def list_tools():
 async def call_tool(name: str, arguments: dict):
     if name == "backtest_strategy":
         # Dummy backtest – replace with real Trader.dev API call
-        # Returns a Sharpe ratio based on strategy complexity (just for testing)
         complexity = len(str(arguments.get("strategy", {})))
         sharpe = round(1.0 + complexity * 0.05, 3)
         return [TextContent(type="text", text=str(sharpe))]
