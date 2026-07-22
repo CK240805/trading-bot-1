@@ -7,3 +7,4 @@ oandapyV20
 mcp
 python-dotenv
 six
+openai
