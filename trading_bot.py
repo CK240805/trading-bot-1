@@ -1,16 +1,18 @@
 """
 Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + Trader.dev MCP
-- Connects to remote Trader.dev MCP server (SSE) for real backtesting/optimization
+- LLM cooldown only on 429 errors (no unnecessary blocking)
+- Live dashboard showing AI ↔ bot dialogues at /dashboard
 - Watch list validated against OANDA instruments
-- Trade size automatically adjusted to OANDA minimums and $100 cap
-- NVIDIA rate-limit protection
+- Trade size auto‑adjusted to instrument minimums and $100 cap
 """
 import os, json, time, logging, threading, asyncio
 from datetime import datetime
 from typing import Optional, List, Dict
+from collections import deque
 import requests
 import schedule
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 import uvicorn
 from telegram import Bot
 from telegram.error import TelegramError
@@ -46,12 +48,10 @@ OANDA_API_KEY = os.getenv("OANDA_API_KEY")
 OANDA_ENV = os.getenv("OANDA_ENV", "practice")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-ALLOCATED_CAPITAL = 100.0
-
-# Trader.dev MCP server URL (SSE endpoint)
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-ai/deepseek-v4")
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://mcp.trader.dev/sse")
-# Optional: force a specific backtest tool name
-MCP_BACKTEST_TOOL = os.getenv("MCP_BACKTEST_TOOL")
+MCP_BACKTEST_TOOL = os.getenv("MCP_BACKTEST_TOOL")   # optional
+ALLOCATED_CAPITAL = 100.0
 
 # NVIDIA client
 llm_client = OpenAI(
@@ -65,29 +65,48 @@ CURRENT_WATCHLIST: List[str] = []
 VALID_INSTRUMENTS: Dict[str, dict] = {}
 _STARTUP_MESSAGE_SENT = False
 
-# Rate limit guard
-LAST_LLM_CALL = 0
-LLM_COOLDOWN_SEC = 120  # 2 minutes
+# Rate limit: only block after a real 429
+LAST_429_TIME = 0
+RATE_LIMIT_COOLDOWN_SEC = 120
 
 DEFAULT_INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
 
+# ---------- Interaction log for dashboard ----------
+INTERACTION_LOG = deque(maxlen=200)   # keep last 200 events
+
+def log_interaction(category: str, role: str, content: str):
+    """Add a timestamped entry to the interaction log."""
+    entry = {
+        "time": datetime.utcnow().isoformat() + "Z",
+        "category": category,   # e.g. "trade", "optimization", "watchlist", "error"
+        "role": role,           # "bot" or "ai"
+        "content": content
+    }
+    INTERACTION_LOG.append(entry)
+    # Also log to console (optional, can be limited)
+    logger.info(f"[{category}] {role}: {content[:200]}")
+
 # ---------- Rate-limited LLM call ----------
-def deepseek_chat(prompt: str, system: str = "") -> str:
-    global LAST_LLM_CALL
+def deepseek_chat(prompt: str, system: str = "", category: str = "general") -> str:
+    """Call the LLM. Cooldown only if we recently hit a 429."""
+    global LAST_429_TIME
     now = time.time()
-    if now - LAST_LLM_CALL < LLM_COOLDOWN_SEC:
-        logger.warning("LLM call skipped – rate limit cooldown active.")
+    if now - LAST_429_TIME < RATE_LIMIT_COOLDOWN_SEC:
+        logger.warning("LLM call skipped – rate limit cooldown active (429).")
+        log_interaction(category, "system", "LLM call blocked by rate-limit cooldown.")
         return ""
-    LAST_LLM_CALL = now
 
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    # Log the prompt we are sending
+    log_interaction(category, "bot", prompt)
+
     try:
         completion = llm_client.chat.completions.create(
-            model="deepseek-ai/deepseek-v4-pro",
+            model=LLM_MODEL,
             messages=messages,
             temperature=1,
             top_p=0.95,
@@ -95,11 +114,14 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
             extra_body={"chat_template_kwargs": {"thinking": False}},
             stream=False
         )
-        return completion.choices[0].message.content
+        response = completion.choices[0].message.content
+        log_interaction(category, "ai", response)
+        return response
     except Exception as e:
         logger.error(f"LLM API error: {e}")
+        log_interaction("error", "system", f"LLM error: {e}")
         if "429" in str(e):
-            LAST_LLM_CALL = now + LLM_COOLDOWN_SEC
+            LAST_429_TIME = time.time()   # start cooldown
         return ""
 
 # ---------- News ----------
@@ -146,7 +168,7 @@ def update_watch_list() -> List[str]:
     news = fetch_news()
     system = "Select 5 OANDA instruments. Return ONLY a JSON array: ['EUR_USD','XAU_USD']"
     prompt = f"News:\n{news}\nTime: {datetime.now().isoformat()}\nProvide JSON array."
-    response = deepseek_chat(prompt, system)
+    response = deepseek_chat(prompt, system, category="watchlist")
     if not response:
         return _filtered_default_watchlist()
 
@@ -157,6 +179,7 @@ def update_watch_list() -> List[str]:
         if isinstance(watchlist, list):
             valid = [i for i in watchlist if i in VALID_INSTRUMENTS]
             if len(valid) < 3:
+                log_interaction("watchlist", "system", f"Too few valid instruments, fallback to default.")
                 return _filtered_default_watchlist()
             while len(valid) < 5:
                 for d in DEFAULT_INSTRUMENTS:
@@ -165,9 +188,11 @@ def update_watch_list() -> List[str]:
                         if len(valid) >= 5:
                             break
             logger.info(f"Watch list: {valid}")
+            log_interaction("watchlist", "system", f"Final watch list: {valid}")
             return valid[:5]
     except:
         pass
+    log_interaction("watchlist", "system", "Parse error, using default watch list.")
     return _filtered_default_watchlist()
 
 def _filtered_default_watchlist():
@@ -219,9 +244,11 @@ def oanda_place_order(instrument, units, sl=None, tp=None):
     try:
         resp = oanda_api.request(orders.OrderCreate(accountID=OANDA_ACCOUNT_ID, data=data))
         logger.info(f"Order placed: {resp}")
+        log_interaction("trade", "system", f"Order placed: {instrument} {units} units")
         return resp
     except Exception as e:
         logger.error(f"Order error: {e}")
+        log_interaction("trade", "system", f"Order failed: {e}")
         return None
 
 def oanda_get_open_trades():
@@ -254,102 +281,95 @@ class LLMStrategyOptimizer:
     def __init__(self):
         self.best_strategy = None
         self.best_sharpe = -9999
-        self.mcp_url = MCP_SERVER_URL
-        self.tool_name = MCP_BACKTEST_TOOL
 
     async def _find_backtest_tool(self, session) -> str:
-        """Return the name of the first tool that contains 'backtest', or the env-specified one."""
         tools = await session.list_tools()
-        logger.info(f"Available MCP tools: {[t.name for t in tools]}")
-        if self.tool_name:
-            if any(t.name == self.tool_name for t in tools):
-                return self.tool_name
+        tool_names = [t.name for t in tools]
+        log_interaction("optimization", "system", f"Available MCP tools: {tool_names}")
+        if MCP_BACKTEST_TOOL:
+            if any(t.name == MCP_BACKTEST_TOOL for t in tools):
+                return MCP_BACKTEST_TOOL
             else:
-                logger.error(f"Specified tool '{self.tool_name}' not found.")
+                log_interaction("optimization", "system", f"Specified tool '{MCP_BACKTEST_TOOL}' not found.")
                 return None
         for t in tools:
             if "backtest" in t.name.lower():
-                logger.info(f"Auto-selected backtest tool: {t.name}")
+                log_interaction("optimization", "system", f"Auto-selected backtest tool: {t.name}")
                 return t.name
-        logger.error("No backtest tool found on MCP server.")
+        log_interaction("optimization", "system", "No backtest tool found.")
         return None
 
     async def _call_mcp_backtest(self, strategy: dict, instrument="EUR_USD", timeframe="H1") -> float:
         try:
-            async with sse_client(self.mcp_url) as (read, write):
+            async with sse_client(MCP_SERVER_URL) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     tool_name = await self._find_backtest_tool(session)
                     if not tool_name:
                         return 0.0
 
-                    # Call the backtest tool – adjust arguments as needed by Trader.dev's tool
                     result = await session.call_tool(
                         tool_name,
                         arguments={
                             "strategy": strategy,
                             "instrument": instrument,
                             "timeframe": timeframe
-                            # Add other required fields if the tool expects them:
-                            # "start_date": "2024-01-01", "end_date": "2025-01-01"
                         }
                     )
                     if result.content and len(result.content) > 0:
                         text = result.content[0].text
                         try:
-                            # Try to parse JSON for a structured response
                             data = json.loads(text)
-                            # Extract Sharpe – adapt these keys to actual response
                             sharpe = data.get("sharpe") or data.get("sharpe_ratio") or \
                                      data.get("performance", {}).get("sharpe") or 0.0
                             return float(sharpe)
                         except:
-                            # Fallback to plain text number
                             return float(text)
                     return 0.0
         except Exception as e:
-            logger.error(f"MCP backtest error: {e}")
+            log_interaction("optimization", "system", f"MCP backtest error: {e}")
             return 0.0
 
     async def run_optimization_loop(self):
         system = (
             "You are a quant strategist. Output a JSON strategy object that Trader.dev can backtest. "
             "Example: {\"type\": \"sma_crossover\", \"fast_ma\": 10, \"slow_ma\": 30, \"stop_loss_pct\": 2}. "
-            "You can vary any values. Only JSON."
+            "Only JSON."
         )
         user = "Propose an initial trading strategy for EUR/USD H1."
-        response = deepseek_chat(user, system)
+        response = deepseek_chat(user, system, category="optimization")
         if not response:
             return
         try:
             current_strategy = json.loads(response)
         except:
+            log_interaction("optimization", "system", "Failed to parse initial strategy JSON.")
             return
 
         for i in range(5):
-            logger.info(f"Iteration {i+1}: Testing strategy...")
+            log_interaction("optimization", "system", f"Iteration {i+1}: Testing strategy...")
             sharpe = await self._call_mcp_backtest(current_strategy)
-            logger.info(f"Sharpe = {sharpe:.3f}")
+            log_interaction("optimization", "system", f"Iteration {i+1} Sharpe = {sharpe:.3f}")
 
             if sharpe > self.best_sharpe:
                 self.best_sharpe = sharpe
                 self.best_strategy = current_strategy
                 if sharpe >= 2.0:
-                    logger.info("Amazing strategy found!")
+                    log_interaction("optimization", "system", "🎉 Amazing strategy found!")
                     break
 
             improvement_prompt = (
                 f"The last strategy (Sharpe {sharpe:.3f}) was: {json.dumps(current_strategy)}. "
                 "Propose an improved version. Only JSON."
             )
-            response = deepseek_chat(improvement_prompt, system)
+            response = deepseek_chat(improvement_prompt, system, category="optimization")
             if not response:
                 break
             try:
                 current_strategy = json.loads(response)
             except:
                 break
-        logger.info(f"Optimization ended. Best Sharpe: {self.best_sharpe:.3f}")
+        log_interaction("optimization", "system", f"Optimization ended. Best Sharpe: {self.best_sharpe:.3f}")
 
 llm_strategy_optimizer = LLMStrategyOptimizer()
 
@@ -358,6 +378,7 @@ def mcp_optimization_runner():
         asyncio.run(llm_strategy_optimizer.run_optimization_loop())
     except Exception as e:
         logger.error(f"Optimization loop error: {e}")
+        log_interaction("optimization", "system", f"Loop crashed: {e}")
 
 # ---------- Jobs ----------
 def morning_analysis():
@@ -370,7 +391,7 @@ def morning_analysis():
         return tg_send_sync("🌅 OANDA data unavailable.")
     news = fetch_news()
     prompt = f"Prices:\n{json.dumps(prices)}\nNews:\n{news}\nGive a short market outlook."
-    analysis = deepseek_chat(prompt, "You are a market analyst.")
+    analysis = deepseek_chat(prompt, "You are a market analyst.", category="morning")
     if analysis:
         tg_send_sync(f"🌅 Morning Analysis ({datetime.now().strftime('%Y-%m-%d')})\nWatch list: {', '.join(CURRENT_WATCHLIST)}\n\n{analysis}")
 
@@ -400,26 +421,31 @@ def trading_decision():
 Return JSON: {{"action":"BUY"|"SELL"|"HOLD","instrument":"...","units":1000,"stop_loss":...,"take_profit":...,"timeframe":"M5"}}.
 Exposure ≤ $100. If HOLD, other fields null."""
         user = f"Time: {datetime.now().isoformat()}\nPrices: {json.dumps(prices)}\nOpen: {json.dumps(open_trades)}\nNews: {news}\nAction?"
-        response = deepseek_chat(user, system)
+        response = deepseek_chat(user, system, category="trade")
         if not response:
             return
         try:
             decision = json.loads(response)
         except:
+            log_interaction("trade", "system", "Failed to parse trade decision JSON.")
             return
         if decision.get("action") == "HOLD":
+            log_interaction("trade", "system", "AI decided HOLD.")
             return
         instrument = decision.get("instrument")
         units = decision.get("units", 0)
         if instrument not in CURRENT_WATCHLIST or units == 0:
+            log_interaction("trade", "system", f"Invalid trade: {instrument} / {units}")
             return
         price = (prices[instrument]["bid"] + prices[instrument]["ask"]) / 2
         valid_units = adjust_units_to_instrument(instrument, units, price)
         if valid_units == 0:
+            log_interaction("trade", "system", f"Trade adjusted to 0 units, rejected.")
             return
         oanda_place_order(instrument, valid_units, decision.get("stop_loss"), decision.get("take_profit"))
     except Exception as e:
         logger.exception(f"Trade error: {e}")
+        log_interaction("trade", "system", f"Trade error: {e}")
 
 def refresh_watch_list_job():
     global CURRENT_WATCHLIST
@@ -445,7 +471,7 @@ def run_scheduler():
             logger.error(f"Scheduler error: {e}")
         time.sleep(1)
 
-# ---------- FastAPI ----------
+# ---------- FastAPI App & Dashboard ----------
 app = FastAPI()
 
 @app.on_event("startup")
@@ -461,11 +487,69 @@ async def startup():
 @app.get("/")
 @app.head("/")
 def root():
-    return {"message": "Trading bot running."}
+    return {"message": "Trading bot running. Visit /dashboard for live interactions."}
 
 @app.get("/health")
 def health():
     return {"status": "ok", "best_sharpe": llm_strategy_optimizer.best_sharpe, "watch_list": CURRENT_WATCHLIST}
+
+@app.get("/api/logs")
+def api_logs():
+    """Return recent interaction logs as JSON."""
+    return list(INTERACTION_LOG)
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    """Simple HTML page that auto‑refreshes the interaction log."""
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Trading Bot Live</title>
+        <meta charset="utf-8">
+        <meta http-equiv="refresh" content="30">
+        <style>
+            body { font-family: monospace; background: #0a0a0a; color: #ccc; padding: 20px; }
+            h1 { color: #00ff88; }
+            .log { max-height: 80vh; overflow-y: auto; border: 1px solid #333; padding: 10px; background: #111; }
+            .entry { margin-bottom: 8px; border-bottom: 1px solid #222; padding-bottom: 5px; }
+            .time { color: #888; font-size: 0.85em; }
+            .role { font-weight: bold; }
+            .bot { color: #4da6ff; }
+            .ai { color: #ffaa00; }
+            .system { color: #888; }
+            .optimization { color: #af5fff; }
+            .watchlist { color: #5fd7ff; }
+            .trade { color: #ff6666; }
+            .error { color: #ff0000; }
+            pre { white-space: pre-wrap; margin: 4px 0; }
+        </style>
+    </head>
+    <body>
+        <h1>🤖 Trading Bot Live</h1>
+        <p>Auto‑refreshes every 30 seconds. Best Sharpe: <span id="sharpe">-</span></p>
+        <div class="log" id="log"></div>
+        <script>
+            async function load() {
+                const resp = await fetch('/api/logs');
+                const logs = await resp.json();
+                const logDiv = document.getElementById('log');
+                logDiv.innerHTML = logs.map(e => `
+                    <div class="entry">
+                        <span class="time">${e.time}</span>
+                        <span class="role ${e.role}">[${e.category}] ${e.role}:</span>
+                        <pre>${e.content}</pre>
+                    </div>`).join('');
+                const sharpeResp = await fetch('/health');
+                const health = await sharpeResp.json();
+                document.getElementById('sharpe').innerText = health.best_sharpe.toFixed(2);
+            }
+            load();
+            setInterval(load, 10000);
+        </script>
+    </body>
+    </html>
+    """
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
