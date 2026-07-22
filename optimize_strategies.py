@@ -17,6 +17,10 @@ TRADERDEV_API_KEY = os.environ.get("TRADERDEV_API_KEY", "")
 GITHUB_GIST_TOKEN = os.environ["GITHUB_GIST_TOKEN"]
 GIST_ID = os.environ.get("GIST_ID")
 
+# Use EUR/USD – Trader.dev likely uses "EURUSD" (without underscore)
+INSTRUMENT = "EURUSD"
+TIMEFRAME = "1h"   # Must be 15m, 1h, or 4h per the error message
+
 llm_client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY)
 
 # ---------- Rate limiter ----------
@@ -72,15 +76,33 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
 
 # ---------- Pine Script helpers ----------
 def fix_pine_version(code: str) -> str:
-    """Ensure the Pine Script starts with //@version=6."""
-    # Replace any existing version directive
     code = re.sub(r'//@version\s*=\s*\d+', '//@version=6', code, count=1)
-    # If no version directive at all, prepend it
     if not code.startswith('//@version'):
         code = '//@version=6\n' + code
     return code
 
 # ---------- MCP helpers ----------
+async def get_valid_symbols(session) -> list:
+    """Fetch available symbols from Trader.dev market coverage."""
+    try:
+        result = await session.call_tool("search_perps", arguments={"query": "EUR"})
+        if result.content and len(result.content) > 0:
+            text = result.content[0].text
+            print(f"Symbol search result: {text[:500]}")
+            data = json.loads(text)
+            # Try to extract symbol names
+            symbols = []
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and 'symbol' in item:
+                        symbols.append(item['symbol'])
+                    elif isinstance(item, str):
+                        symbols.append(item)
+            return symbols
+    except Exception as e:
+        print(f"Symbol search error: {e}")
+    return []
+
 async def get_pine_rules(session) -> str:
     try:
         result = await session.call_tool("get_pine_codegen_rules", arguments={})
@@ -90,24 +112,23 @@ async def get_pine_rules(session) -> str:
         print(f"Could not get Pine rules: {e}")
     return ""
 
-async def backtest_pine_script(session, pine_code: str, instrument="EUR_USD", timeframe="H1") -> float:
+async def backtest_pine_script(session, pine_code: str, symbol: str, timeframe: str) -> float:
     pine_code = fix_pine_version(pine_code)
-    print(f"First line of Pine: {pine_code.split(chr(10))[0]}")
+    print(f"Testing {symbol} {timeframe} | First line: {pine_code.split(chr(10))[0]}")
     try:
         result = await session.call_tool(
             "quick_backtest",
             arguments={
-                "symbol": instrument,
+                "symbol": symbol,
                 "timeframe": timeframe,
                 "pineSource": pine_code
             }
         )
         if result.content and len(result.content) > 0:
             text = result.content[0].text
-            print(f"Raw backtest response: {text[:500]}")
-            # Check for errors
-            if "error" in text.lower() or "mcprule_rejected" in text.lower():
-                print(f"Backtest rejected: {text[:300]}")
+            print(f"Raw response: {text[:400]}")
+            if "error" in text.lower() or "no_bars" in text.lower():
+                print(f"Backtest failed: {text[:300]}")
                 return 0.0
             try:
                 data = json.loads(text)
@@ -182,28 +203,40 @@ async def main():
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            # Get Pine Script rules
+            # Find valid symbol
+            symbols = await get_valid_symbols(session)
+            symbol = INSTRUMENT
+            if symbols:
+                # Try to find EURUSD in the list
+                for s in symbols:
+                    if "EUR" in s.upper() and "USD" in s.upper():
+                        symbol = s
+                        break
+                print(f"Using symbol: {symbol} (available: {symbols[:5]}…)")
+            else:
+                print(f"No symbols found via search – trying {symbol}")
+
+            # Try multiple timeframes – Trader.dev requires 15m, 1h, or 4h
+            timeframes = ["1h", "4h", "15m"]
+
             pine_rules = await get_pine_rules(session)
             if pine_rules:
                 print(f"Pine rules received ({len(pine_rules)} chars)")
 
-            # Prompt for Pine Script v6
             system = (
-                "You are a Pine Script expert. Generate a COMPLETE Pine Script v6 strategy "
-                "that can be backtested. CRITICAL: the first line MUST be exactly:\n"
-                "//@version=6\n"
+                "You are a Pine Script expert. Generate a COMPLETE Pine Script v6 strategy. "
+                "CRITICAL: the first line MUST be exactly:\n//@version=6\n"
                 "Include entry/exit rules, stop loss, take profit. Use standard indicators. "
                 "Output ONLY the Pine Script code, no markdown fences, no explanations.\n"
-                f"Additional rules from the platform:\n{pine_rules}"
+                f"Additional rules:\n{pine_rules}"
             )
-            user = "Write a complete Pine Script v6 strategy for EUR/USD H1 with entry/exit rules and risk management."
+            user = f"Write a Pine Script v6 strategy for {symbol} {timeframes[0]}."
 
             response = deepseek_chat(user, system)
             if not response:
                 print("❌ LLM returned no strategy.")
                 return
 
-            # Clean up response
             if "```" in response:
                 response = response.split("```")[1]
                 if response.lower().startswith("pine"):
@@ -211,8 +244,15 @@ async def main():
             current_pine = response.strip()
 
             for i in range(2):
-                print(f"Iteration {i+1}: Testing strategy…")
-                sharpe = await backtest_pine_script(session, current_pine)
+                # Try each timeframe until one works
+                sharpe = 0.0
+                for tf in timeframes:
+                    print(f"Iteration {i+1}: Testing {symbol} {tf}…")
+                    sharpe = await backtest_pine_script(session, current_pine, symbol, tf)
+                    if sharpe != 0.0 or "no_bars" not in str(sharpe):
+                        break
+                    print(f"  {tf} failed, trying next timeframe…")
+
                 print(f"  Sharpe = {sharpe:.3f}")
 
                 if sharpe > best_sharpe:
@@ -228,11 +268,11 @@ async def main():
                         print("🎉 Amazing strategy found!")
                         break
 
-                if i < 1:  # Don't ask for improvement on the last iteration
+                if i < 1:
                     prompt = (
-                        f"The Pine Script below achieved a Sharpe of {sharpe:.3f}. "
-                        f"Improve it to get a higher Sharpe. Return ONLY the improved Pine Script v6 code.\n\n"
-                        f"Current code:\n{current_pine}"
+                        f"The Pine Script achieved a Sharpe of {sharpe:.3f} on {symbol}. "
+                        f"Improve it. Return ONLY the improved Pine Script v6 code.\n\n"
+                        f"Current:\n{current_pine}"
                     )
                     response = deepseek_chat(prompt, system)
                     if not response:
