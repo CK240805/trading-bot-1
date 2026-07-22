@@ -1,7 +1,7 @@
 """
-Autonomous Trading Bot – DeepSeek + OANDA + Telegram + MCP (Trader.dev)
-Dynamic watch list determined by DeepSeek LLM.
-LLM-driven strategy optimization loop using Trader.dev via MCP proxy.
+Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + MCP (Trader.dev)
+Dynamic watch list determined by LLM.
+LLM-driven strategy optimization using Trader.dev via MCP proxy.
 Set all required environment variables before running.
 """
 import os, json, time, logging, threading, asyncio
@@ -25,6 +25,9 @@ import oandapyV20.endpoints.accounts as accounts
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+# NVIDIA LLM client
+from openai import OpenAI
+
 # Load .env file locally (ignored on Render)
 try:
     from dotenv import load_dotenv
@@ -37,7 +40,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("TradingBot")
 
 # ---------- Config from environment ----------
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")          # required
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 OANDA_API_KEY = os.getenv("OANDA_API_KEY")
 OANDA_ENV = os.getenv("OANDA_ENV", "practice")
@@ -47,8 +50,14 @@ MCP_SERVER_COMMAND = os.getenv("MCP_SERVER_COMMAND", "python")
 MCP_SERVER_ARGS = os.getenv("MCP_SERVER_ARGS", "mcp_server.py").split()
 ALLOCATED_CAPITAL = 100.0  # hard cap in USD
 
-# Trader.dev API (used by MCP proxy, but may be needed if you want direct calls – keep as env)
+# Trader.dev API (used by MCP proxy)
 TRADERDEV_API_KEY = os.getenv("TRADERDEV_API_KEY")
+
+# NVIDIA client
+llm_client = OpenAI(
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=NVIDIA_API_KEY
+)
 
 OANDA_URL = "https://api-fxpractice.oanda.com" if OANDA_ENV == "practice" else "https://api-fxtrade.oanda.com"
 oanda_api = API(access_token=OANDA_API_KEY, environment=OANDA_ENV)
@@ -56,25 +65,28 @@ oanda_api = API(access_token=OANDA_API_KEY, environment=OANDA_ENV)
 DEFAULT_TIMEFRAME = "M5"
 CURRENT_WATCHLIST: List[str] = []
 
-# ---------- DeepSeek Client ----------
+# ---------- NVIDIA LLM Chat ----------
 def deepseek_chat(prompt: str, system: str = "") -> str:
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "model": "deepseek-chat",
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.3
-    }
-    resp = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=data, timeout=30)
-    if resp.status_code != 200:
-        logger.error(f"DeepSeek API error: {resp.text}")
+    """Send a prompt to NVIDIA's DeepSeek model and return the text response."""
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    try:
+        completion = llm_client.chat.completions.create(
+            model="deepseek-ai/deepseek-v4-pro",
+            messages=messages,
+            temperature=1,
+            top_p=0.95,
+            max_tokens=16384,
+            extra_body={"chat_template_kwargs": {"thinking": False}},
+            stream=False
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        logger.error(f"LLM API error: {e}")
         return ""
-    return resp.json()["choices"][0]["message"]["content"]
 
 # ---------- News Fetcher ----------
 def fetch_news() -> str:
@@ -101,6 +113,9 @@ def update_watch_list() -> List[str]:
     )
     prompt = f"Recent financial news headlines:\n{news}\n\nCurrent datetime: {datetime.now().isoformat()}\n\nProvide the JSON array."
     response = deepseek_chat(prompt, system)
+    if not response:
+        logger.warning("LLM call failed, using default watch list.")
+        return ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
     try:
         if "```" in response:
             snippet = response.split("```")[1]
@@ -194,9 +209,17 @@ async def send_telegram_message(text: str):
         logger.error(f"Telegram error: {e}")
 
 def tg_send_sync(text: str):
-    asyncio.run(send_telegram_message(text))
+    """Send a Telegram message from a synchronous context (scheduler thread)."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        asyncio.run(send_telegram_message(text))
+    else:
+        asyncio.ensure_future(send_telegram_message(text))
 
-# ---------- LLM-Driven Strategy Optimizer (uses MCP proxy -> Trader.dev) ----------
+# ---------- LLM-Driven Strategy Optimizer (MCP proxy -> Trader.dev) ----------
 class LLMStrategyOptimizer:
     def __init__(self):
         self.best_strategy = None
@@ -231,6 +254,9 @@ class LLMStrategyOptimizer:
         )
         user = "Propose an initial trading strategy for EUR/USD on H1 timeframe. Be creative but use standard indicators."
         response = deepseek_chat(user, system)
+        if not response:
+            logger.error("LLM did not return a strategy proposal.")
+            return
         try:
             current_strategy = json.loads(response)
         except:
@@ -256,6 +282,9 @@ class LLMStrategyOptimizer:
                 f"Previous strategy: {json.dumps(current_strategy)}"
             )
             response = deepseek_chat(improvement_prompt, system)
+            if not response:
+                logger.error("LLM improvement call failed.")
+                break
             try:
                 current_strategy = json.loads(response)
             except:
@@ -273,7 +302,13 @@ def mcp_optimization_runner():
 def morning_analysis():
     global CURRENT_WATCHLIST
     CURRENT_WATCHLIST = update_watch_list()
+    if not CURRENT_WATCHLIST:
+        tg_send_sync("🌅 Morning analysis skipped – watch list is empty.")
+        return
     prices = oanda_get_prices(CURRENT_WATCHLIST)
+    if not prices:
+        tg_send_sync("🌅 OANDA data unavailable – check API keys or instrument names.")
+        return
     news = fetch_news()
     prompt = f"""Current market snapshot for the selected instruments (bid/ask):
 {json.dumps(prices, indent=2)}
@@ -282,12 +317,19 @@ Recent news headlines:
 
 Provide a concise morning market outlook for the above instruments. Keep under 400 words."""
     analysis = deepseek_chat(prompt, "You are a professional financial market analyst.")
+    if not analysis:
+        tg_send_sync("🌅 Morning analysis failed – LLM unavailable.")
+        return
     message = f"🌅 *Morning Market Analysis* ({datetime.now().strftime('%Y-%m-%d')})\n\n🎯 Watch list: {', '.join(CURRENT_WATCHLIST)}\n\n{analysis}"
     tg_send_sync(message)
 
 # ---------- Night Performance Report Job ----------
 def night_performance():
-    summary = oanda_get_account_summary()
+    try:
+        summary = oanda_get_account_summary()
+    except Exception as e:
+        tg_send_sync(f"🌙 Night report failed – can't reach OANDA: {e}")
+        return
     trades_list = oanda_get_open_trades()
     pnl = float(summary.get("unrealizedPL", 0))
     balance = float(summary.get("balance", 0))
@@ -309,6 +351,9 @@ def trading_decision():
         CURRENT_WATCHLIST = update_watch_list()
     try:
         prices = oanda_get_prices(CURRENT_WATCHLIST)
+        if not prices:
+            logger.warning("No price data for watch list, skipping trading decision.")
+            return
         open_trades = oanda_get_open_trades()
         news = fetch_news()
         system_prompt = f"""You are an autonomous trading bot. You manage a $100 allocation on OANDA demo.
@@ -319,6 +364,9 @@ If HOLD, other fields can be null.
 Ensure |units| * price <= $100."""
         user_prompt = f"Current time: {datetime.now().isoformat()}\nPrices: {json.dumps(prices)}\nOpen positions: {json.dumps(open_trades)}\nNews: {news}\n\nAnalyse and provide the next trade action in JSON."
         response = deepseek_chat(user_prompt, system_prompt)
+        if not response:
+            logger.error("LLM trading decision failed.")
+            return
         try:
             decision = json.loads(response)
         except:
@@ -328,12 +376,14 @@ Ensure |units| * price <= $100."""
                     snippet = snippet[4:]
                 decision = json.loads(snippet.strip())
             else:
+                logger.error("Could not parse trading decision.")
                 return
         if decision.get("action") == "HOLD":
             return
         instrument = decision.get("instrument")
         units = decision.get("units", 0)
         if instrument not in CURRENT_WATCHLIST or units == 0:
+            logger.info(f"Invalid trade: {instrument} / {units}")
             return
         if not check_risk_allocation(instrument, units):
             return
@@ -348,7 +398,7 @@ def refresh_watch_list_job():
 
 # ---------- Scheduler Thread ----------
 def run_scheduler():
-    schedule.every(5).minutes.do(mcp_optimization_runner)      # LLM-driven optimization
+    schedule.every(5).minutes.do(mcp_optimization_runner)
     schedule.every().day.at("07:00").do(morning_analysis)
     schedule.every().day.at("21:00").do(night_performance)
     schedule.every(1).minutes.do(trading_decision)
@@ -363,10 +413,17 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def startup_event():
-    threading.Thread(target=run_scheduler, daemon=True).start()
     global CURRENT_WATCHLIST
-    CURRENT_WATCHLIST = update_watch_list()
-    tg_send_sync(f"🤖 Trading bot started. Allocated capital: $100.\nWatch list: {', '.join(CURRENT_WATCHLIST)}")
+    try:
+        CURRENT_WATCHLIST = update_watch_list()
+    except Exception as e:
+        logger.error(f"Initial watch list failed: {e}")
+        CURRENT_WATCHLIST = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
+    threading.Thread(target=run_scheduler, daemon=True).start()
+    await send_telegram_message(
+        f"🤖 Trading bot started. Allocated capital: $100.\n"
+        f"Watch list: {', '.join(CURRENT_WATCHLIST)}"
+    )
 
 @app.get("/health")
 def health():
