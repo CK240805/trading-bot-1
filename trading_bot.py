@@ -1,12 +1,11 @@
 """
 Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + MCP (Trader.dev)
-Dynamic watch list determined by LLM.
-LLM-driven strategy optimization using Trader.dev via MCP proxy.
+Dynamic watch list determined by LLM, validated against OANDA instruments.
 Set all required environment variables before running.
 """
 import os, json, time, logging, threading, asyncio
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Set
 import requests
 import schedule
 from fastapi import FastAPI
@@ -64,9 +63,13 @@ oanda_api = API(access_token=OANDA_API_KEY, environment=OANDA_ENV)
 
 DEFAULT_TIMEFRAME = "M5"
 CURRENT_WATCHLIST: List[str] = []
+VALID_INSTRUMENTS: Set[str] = set()
 
 # Duplicate Telegram startup message guard
 _STARTUP_MESSAGE_SENT = False
+
+# Default safe instruments (guaranteed to exist on most OANDA demo accounts)
+DEFAULT_INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
 
 # ---------- NVIDIA LLM Chat ----------
 def deepseek_chat(prompt: str, system: str = "") -> str:
@@ -104,8 +107,32 @@ def fetch_news() -> str:
     except Exception as e:
         return f"News fetch error: {e}"
 
+# ---------- OANDA Instrument Validation ----------
+def get_valid_instruments() -> Set[str]:
+    """Fetch the list of tradeable instruments from OANDA and return a set of names."""
+    try:
+        r = accounts.AccountInstruments(accountID=OANDA_ACCOUNT_ID)
+        resp = oanda_api.request(r)
+        instruments = {instr["name"] for instr in resp.get("instruments", [])}
+        logger.info(f"Fetched {len(instruments)} valid instruments from OANDA.")
+        return instruments
+    except Exception as e:
+        logger.error(f"Failed to fetch OANDA instruments: {e}")
+        # Return a minimal safe set if API fails
+        return set(DEFAULT_INSTRUMENTS)
+
+def update_valid_instruments():
+    global VALID_INSTRUMENTS
+    VALID_INSTRUMENTS = get_valid_instruments()
+    if not VALID_INSTRUMENTS:
+        VALID_INSTRUMENTS = set(DEFAULT_INSTRUMENTS)
+
 # ---------- Dynamic Watch List ----------
 def update_watch_list() -> List[str]:
+    global VALID_INSTRUMENTS
+    if not VALID_INSTRUMENTS:
+        update_valid_instruments()
+
     news = fetch_news()
     system = (
         "You are a professional financial market analyst. "
@@ -118,7 +145,8 @@ def update_watch_list() -> List[str]:
     response = deepseek_chat(prompt, system)
     if not response:
         logger.warning("LLM call failed, using default watch list.")
-        return ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
+        return _filtered_default_watchlist()
+
     try:
         if "```" in response:
             snippet = response.split("```")[1]
@@ -127,13 +155,33 @@ def update_watch_list() -> List[str]:
             watchlist = json.loads(snippet.strip())
         else:
             watchlist = json.loads(response.strip())
+
         if isinstance(watchlist, list) and all(isinstance(i, str) for i in watchlist):
-            logger.info(f"Updated watch list: {watchlist}")
-            return watchlist
+            # Validate against OANDA instruments
+            valid_watchlist = [i for i in watchlist if i in VALID_INSTRUMENTS]
+            if len(valid_watchlist) < 3:  # if too few valid, use defaults
+                logger.warning("Too many invalid instruments, using default watch list.")
+                return _filtered_default_watchlist()
+            # Top up to 5 if needed
+            while len(valid_watchlist) < 5:
+                for default in DEFAULT_INSTRUMENTS:
+                    if default not in valid_watchlist and default in VALID_INSTRUMENTS:
+                        valid_watchlist.append(default)
+                        if len(valid_watchlist) >= 5:
+                            break
+            logger.info(f"Updated watch list: {valid_watchlist}")
+            return valid_watchlist[:5]
     except Exception as e:
         logger.error(f"Failed to parse watch list: {e}")
+
     logger.warning("Using default watch list.")
-    return ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
+    return _filtered_default_watchlist()
+
+def _filtered_default_watchlist() -> List[str]:
+    """Return the default instruments, filtered to only those valid on the account."""
+    if not VALID_INSTRUMENTS:
+        return DEFAULT_INSTRUMENTS.copy()
+    return [i for i in DEFAULT_INSTRUMENTS if i in VALID_INSTRUMENTS][:5]
 
 # ---------- OANDA Helpers ----------
 def oanda_get_prices(instruments: list) -> dict:
@@ -245,7 +293,6 @@ class LLMStrategyOptimizer:
                         "timeframe": timeframe
                     }
                 )
-                # MCP returns a CallToolResult with a list of content items
                 if result.content and len(result.content) > 0:
                     sharpe_str = result.content[0].text
                     return float(sharpe_str)
@@ -392,6 +439,7 @@ Ensure |units| * price <= $100."""
             return
         instrument = decision.get("instrument")
         units = decision.get("units", 0)
+        # Additional safety: ensure instrument is in the current (already validated) watch list
         if instrument not in CURRENT_WATCHLIST or units == 0:
             logger.info(f"Invalid trade: {instrument} / {units}")
             return
@@ -406,13 +454,21 @@ def refresh_watch_list_job():
     global CURRENT_WATCHLIST
     CURRENT_WATCHLIST = update_watch_list()
 
+# ---------- Periodic Instrument List Refresh ----------
+def refresh_instrument_list_job():
+    update_valid_instruments()
+
 # ---------- Scheduler Thread ----------
 def run_scheduler():
+    # Fetch valid instruments once at startup
+    update_valid_instruments()
+
     schedule.every(5).minutes.do(mcp_optimization_runner)
     schedule.every().day.at("07:00").do(morning_analysis)
     schedule.every().day.at("21:00").do(night_performance)
     schedule.every(1).minutes.do(trading_decision)
     schedule.every(4).hours.do(refresh_watch_list_job)
+    schedule.every(6).hours.do(refresh_instrument_list_job)  # refresh valid instruments
 
     while True:
         try:
@@ -427,11 +483,13 @@ app = FastAPI()
 @app.on_event("startup")
 async def startup_event():
     global CURRENT_WATCHLIST, _STARTUP_MESSAGE_SENT
+    # Ensure valid instruments are fetched before the first watch list
+    update_valid_instruments()
     try:
         CURRENT_WATCHLIST = update_watch_list()
     except Exception as e:
         logger.error(f"Initial watch list failed: {e}")
-        CURRENT_WATCHLIST = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
+        CURRENT_WATCHLIST = _filtered_default_watchlist()
     threading.Thread(target=run_scheduler, daemon=True).start()
     if not _STARTUP_MESSAGE_SENT:
         await send_telegram_message(
