@@ -4,6 +4,8 @@ Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + Trader.dev
 - No unsupported extra_body params
 - LLM cooldown only on 429 errors
 - Live dashboard at /dashboard
+- MCP backtest errors fully logged (unpacked ExceptionGroup)
+- Trader.dev MCP authentication via TRADERDEV_API_KEY
 """
 import os, json, time, logging, threading, asyncio
 from datetime import datetime
@@ -31,6 +33,7 @@ from mcp.client.sse import sse_client
 # NVIDIA LLM client
 from openai import OpenAI
 
+# Load .env locally
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -47,9 +50,10 @@ OANDA_API_KEY = os.getenv("OANDA_API_KEY")
 OANDA_ENV = os.getenv("OANDA_ENV", "practice")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-ai/deepseek-v4-flash")   # 🆕 working model
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-ai/deepseek-v4-flash")
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://mcp.trader.dev/sse")
-MCP_BACKTEST_TOOL = os.getenv("MCP_BACKTEST_TOOL")   # optional
+MCP_BACKTEST_TOOL = os.getenv("MCP_BACKTEST_TOOL")      # optional
+TRADERDEV_API_KEY = os.getenv("TRADERDEV_API_KEY")      # for Trader.dev MCP auth
 ALLOCATED_CAPITAL = 100.0
 
 # NVIDIA client
@@ -106,7 +110,6 @@ def deepseek_chat(prompt: str, system: str = "", category: str = "general") -> s
             temperature=1,
             top_p=0.95,
             max_tokens=16384,
-            # ❌ removed extra_body to avoid 404 on models that don't support it
             stream=False
         )
         response = completion.choices[0].message.content
@@ -292,8 +295,12 @@ class LLMStrategyOptimizer:
         return None
 
     async def _call_mcp_backtest(self, strategy: dict, instrument="EUR_USD", timeframe="H1") -> float:
+        headers = {}
+        if TRADERDEV_API_KEY:
+            headers["Authorization"] = f"Bearer {TRADERDEV_API_KEY}"
+
         try:
-            async with sse_client(MCP_SERVER_URL) as (read, write):
+            async with sse_client(MCP_SERVER_URL, headers=headers) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     tool_name = await self._find_backtest_tool(session)
@@ -319,7 +326,14 @@ class LLMStrategyOptimizer:
                             return float(text)
                     return 0.0
         except Exception as e:
-            log_interaction("optimization", "system", f"MCP backtest error: {e}")
+            # Unpack ExceptionGroup (Python 3.11+) to see the real error
+            if hasattr(e, 'exceptions'):
+                for sub_exc in e.exceptions:
+                    logger.error(f"MCP inner exception: {sub_exc}", exc_info=True)
+                    log_interaction("optimization", "system", f"MCP inner error: {sub_exc}")
+            else:
+                logger.error(f"MCP backtest error: {e}", exc_info=True)
+                log_interaction("optimization", "system", f"MCP backtest error: {e}")
             return 0.0
 
     async def run_optimization_loop(self):
