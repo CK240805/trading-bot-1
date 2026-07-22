@@ -1,11 +1,10 @@
 """
 Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + Trader.dev MCP
-- Uses configurable LLM_MODEL (default: deepseek-ai/deepseek-v4-flash)
-- No unsupported extra_body params
+- Live news from Google News RSS, analysed by DeepSeek
+- News briefing cached for 30 min, raw headlines cached for 5 min
+- Handles MCP tools as tuples (fixes AttributeError)
 - LLM cooldown only on 429 errors
 - Live dashboard at /dashboard
-- MCP backtest errors fully logged (unpacked ExceptionGroup)
-- Trader.dev MCP authentication via TRADERDEV_API_KEY
 """
 import os, json, time, logging, threading, asyncio
 from datetime import datetime
@@ -32,6 +31,9 @@ from mcp.client.sse import sse_client
 
 # NVIDIA LLM client
 from openai import OpenAI
+
+# For Google News RSS
+import xml.etree.ElementTree as ET
 
 # Load .env locally
 try:
@@ -74,6 +76,21 @@ RATE_LIMIT_COOLDOWN_SEC = 120
 
 DEFAULT_INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
 
+# ---------- News cache ----------
+_last_raw_headlines: str = ""
+_last_raw_headlines_time: float = 0.0
+RAW_NEWS_MAX_AGE_SEC = 300   # re-fetch raw headlines after 5 minutes
+
+_last_news_briefing: str = ""
+_last_news_briefing_time: float = 0.0
+NEWS_BRIEFING_MAX_AGE_SEC = 1800   # re-analyse news after 30 minutes
+
+# Google News RSS URL (business news, US edition)
+GOOGLE_NEWS_RSS_URL = (
+    "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx6TVdZU0FtVnVHZ0pWVXlnQVAB"
+    "?hl=en-US&gl=US&ceid=US:en"
+)
+
 # ---------- Interaction log ----------
 INTERACTION_LOG = deque(maxlen=200)
 
@@ -87,7 +104,7 @@ def log_interaction(category: str, role: str, content: str):
     INTERACTION_LOG.append(entry)
     logger.info(f"[{category}] {role}: {content[:200]}")
 
-# ---------- LLM call (no extra_body) ----------
+# ---------- LLM call ----------
 def deepseek_chat(prompt: str, system: str = "", category: str = "general") -> str:
     global LAST_429_TIME
     now = time.time()
@@ -122,18 +139,70 @@ def deepseek_chat(prompt: str, system: str = "", category: str = "general") -> s
             LAST_429_TIME = time.time()
         return ""
 
-# ---------- News ----------
-def fetch_news() -> str:
-    api_key = os.getenv("NEWS_API_KEY")
-    if not api_key:
-        return "No news API key set."
-    url = f"https://newsapi.org/v2/top-headlines?category=business&language=en&apiKey={api_key}"
+# ---------- Fetch raw headlines from Google News RSS ----------
+def fetch_raw_headlines() -> str:
+    """Return a string of the latest business headlines from Google News RSS, or empty on failure."""
+    global _last_raw_headlines, _last_raw_headlines_time
+    now = time.time()
+    # Use cache if fresh enough
+    if _last_raw_headlines and (now - _last_raw_headlines_time) < RAW_NEWS_MAX_AGE_SEC:
+        return _last_raw_headlines
+
     try:
-        resp = requests.get(url, timeout=10)
-        articles = resp.json().get("articles", [])[:5]
-        return "\n".join([f"- {a['title']}" for a in articles])
-    except:
-        return "News fetch error."
+        resp = requests.get(GOOGLE_NEWS_RSS_URL, timeout=10)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        headlines = []
+        for item in root.iter("item"):
+            title_elem = item.find("title")
+            if title_elem is not None and title_elem.text:
+                headlines.append(f"- {title_elem.text.strip()}")
+        if not headlines:
+            logger.warning("Google News RSS returned no headlines.")
+            return ""
+        raw = "\n".join(headlines[:10])   # limit to 10 headlines
+        _last_raw_headlines = raw
+        _last_raw_headlines_time = now
+        logger.info(f"Fetched {len(headlines[:10])} headlines from Google News.")
+        return raw
+    except Exception as e:
+        logger.error(f"Failed to fetch Google News: {e}")
+        return ""
+
+# ---------- Get market news briefing (raw headlines → DeepSeek analysis) ----------
+def get_news_briefing(force: bool = False) -> str:
+    """
+    Fetch live headlines from Google News, then ask DeepSeek to analyse them
+    into a concise trader's briefing. The briefing is cached for 30 min.
+    If headlines can't be fetched, returns the last cached briefing if available,
+    otherwise an empty string.
+    """
+    global _last_news_briefing, _last_news_briefing_time
+    now = time.time()
+
+    # If briefing is still fresh and not forced, return cached
+    if not force and _last_news_briefing and (now - _last_news_briefing_time) < NEWS_BRIEFING_MAX_AGE_SEC:
+        return _last_news_briefing
+
+    raw_headlines = fetch_raw_headlines()
+    if not raw_headlines:
+        # Fallback: keep using last briefing if available, otherwise empty
+        return _last_news_briefing if _last_news_briefing else ""
+
+    system = (
+        "You are a senior financial news analyst. Based on the headlines below, provide a concise "
+        "market briefing for a trader. Highlight key events, market sentiment, and potential impact on "
+        "forex, commodities, and indices. Keep it under 200 words."
+    )
+    prompt = f"Recent business headlines:\n{raw_headlines}\n\nProvide a briefing."
+    briefing = deepseek_chat(prompt, system, category="news_analysis")
+    if briefing:
+        _last_news_briefing = briefing
+        _last_news_briefing_time = now
+        return briefing
+    else:
+        # If LLM fails, return raw headlines as a fallback
+        return raw_headlines
 
 # ---------- OANDA instruments ----------
 def get_valid_instruments() -> Dict[str, dict]:
@@ -163,9 +232,9 @@ def update_watch_list() -> List[str]:
     if not VALID_INSTRUMENTS:
         update_valid_instruments()
 
-    news = fetch_news()
+    news_briefing = get_news_briefing(force=True)   # always get fresh for watch list
     system = "Select 5 OANDA instruments. Return ONLY a JSON array: ['EUR_USD','XAU_USD']"
-    prompt = f"News:\n{news}\nTime: {datetime.now().isoformat()}\nProvide JSON array."
+    prompt = f"Market briefing:\n{news_briefing}\n\nTime: {datetime.now().isoformat()}\nProvide JSON array." if news_briefing else f"Time: {datetime.now().isoformat()}\nProvide JSON array."
     response = deepseek_chat(prompt, system, category="watchlist")
     if not response:
         return _filtered_default_watchlist()
@@ -279,18 +348,27 @@ class LLMStrategyOptimizer:
 
     async def _find_backtest_tool(self, session) -> str:
         tools = await session.list_tools()
-        tool_names = [t.name for t in tools]
+        tool_names = []
+        for t in tools:
+            if hasattr(t, 'name'):
+                tool_names.append(t.name)
+            elif isinstance(t, (tuple, list)) and len(t) > 0:
+                tool_names.append(str(t[0]))
+            elif isinstance(t, dict) and 'name' in t:
+                tool_names.append(t['name'])
+            else:
+                tool_names.append(str(t))
         log_interaction("optimization", "system", f"Available MCP tools: {tool_names}")
         if MCP_BACKTEST_TOOL:
-            if any(t.name == MCP_BACKTEST_TOOL for t in tools):
+            if MCP_BACKTEST_TOOL in tool_names:
                 return MCP_BACKTEST_TOOL
             else:
                 log_interaction("optimization", "system", f"Specified tool '{MCP_BACKTEST_TOOL}' not found.")
                 return None
-        for t in tools:
-            if "backtest" in t.name.lower():
-                log_interaction("optimization", "system", f"Auto-selected backtest tool: {t.name}")
-                return t.name
+        for name in tool_names:
+            if "backtest" in name.lower():
+                log_interaction("optimization", "system", f"Auto-selected backtest tool: {name}")
+                return name
         log_interaction("optimization", "system", "No backtest tool found.")
         return None
 
@@ -326,7 +404,6 @@ class LLMStrategyOptimizer:
                             return float(text)
                     return 0.0
         except Exception as e:
-            # Unpack ExceptionGroup (Python 3.11+) to see the real error
             if hasattr(e, 'exceptions'):
                 for sub_exc in e.exceptions:
                     logger.error(f"MCP inner exception: {sub_exc}", exc_info=True)
@@ -393,8 +470,9 @@ def morning_analysis():
     prices = oanda_get_prices(CURRENT_WATCHLIST)
     if not prices:
         return tg_send_sync("🌅 OANDA data unavailable.")
-    news = fetch_news()
-    prompt = f"Prices:\n{json.dumps(prices)}\nNews:\n{news}\nGive a short market outlook."
+    news_briefing = get_news_briefing(force=True)
+    news_block = f"\nMarket news briefing:\n{news_briefing}" if news_briefing else ""
+    prompt = f"Prices:\n{json.dumps(prices)}{news_block}\nGive a short market outlook."
     analysis = deepseek_chat(prompt, "You are a market analyst.", category="morning")
     if analysis:
         tg_send_sync(f"🌅 Morning Analysis ({datetime.now().strftime('%Y-%m-%d')})\nWatch list: {', '.join(CURRENT_WATCHLIST)}\n\n{analysis}")
@@ -420,11 +498,12 @@ def trading_decision():
         if not prices:
             return
         open_trades = oanda_get_open_trades()
-        news = fetch_news()
+        news_briefing = get_news_briefing()   # cached, only refreshes every 30 min (raw headlines every 5 min)
+        news_block = f"\nMarket news briefing:\n{news_briefing}" if news_briefing else ""
         system = f"""You are a trading bot. Trade only: {', '.join(CURRENT_WATCHLIST)}.
 Return JSON: {{"action":"BUY"|"SELL"|"HOLD","instrument":"...","units":1000,"stop_loss":...,"take_profit":...,"timeframe":"M5"}}.
 Exposure ≤ $100. If HOLD, other fields null."""
-        user = f"Time: {datetime.now().isoformat()}\nPrices: {json.dumps(prices)}\nOpen: {json.dumps(open_trades)}\nNews: {news}\nAction?"
+        user = f"Time: {datetime.now().isoformat()}\nPrices: {json.dumps(prices)}\nOpen: {json.dumps(open_trades)}{news_block}\nAction?"
         response = deepseek_chat(user, system, category="trade")
         if not response:
             return
