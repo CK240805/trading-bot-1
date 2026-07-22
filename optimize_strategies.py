@@ -1,6 +1,6 @@
 """
 Pre‑trading strategy optimization – DeepSeek + Trader.dev MCP
-Creates strategy, runs backtest, polls for result, extracts Sharpe.
+Creates strategy, runs backtest, extracts Sharpe (inline or via polling).
 Saves the best strategy to a GitHub Gist.
 """
 import os, json, time, asyncio, requests, re
@@ -89,7 +89,6 @@ def clean_pine_code(code: str) -> str:
     if not code.strip().startswith('//@version'):
         code = '//@version=6\n' + code
     code = re.sub(r'[^\x00-\x7F]+', '', code)
-    # Fix strategy settings
     code = re.sub(r'pyramiding\s*=\s*\d+', 'pyramiding=1', code)
     code = re.sub(r'default_qty_type\s*=\s*strategy\.\w+', 'default_qty_type=strategy.percent_of_equity', code)
     code = re.sub(r'default_qty_value\s*=\s*\d+', 'default_qty_value=100', code)
@@ -97,22 +96,26 @@ def clean_pine_code(code: str) -> str:
     return code.strip()
 
 def generate_strategy_name() -> str:
-    """Generate a unique strategy name."""
     return f"opt-{int(time.time())}"
 
-# ---------- MCP workflow ----------
+# ---------- Sharpe extraction ----------
 def extract_sharpe(text: str) -> float:
-    """Deep search for Sharpe in backtest result."""
+    """Deep search for Sharpe ratio in any JSON structure."""
     try:
         data = json.loads(text)
         def find(obj, depth=0):
-            if depth > 6:
+            if depth > 8:
                 return None
             if isinstance(obj, dict):
                 for k, v in obj.items():
                     if "sharpe" in k.lower() and isinstance(v, (int, float)):
                         return float(v)
                     r = find(v, depth + 1)
+                    if r is not None:
+                        return r
+            elif isinstance(obj, list):
+                for item in obj:
+                    r = find(item, depth + 1)
                     if r is not None:
                         return r
             return None
@@ -126,117 +129,91 @@ def extract_sharpe(text: str) -> float:
         return float(match.group(1))
     return 0.0
 
+# ---------- Full backtest workflow ----------
 async def create_and_backtest(session, pine_code: str, symbol: str, timeframe: str) -> float:
-    """Full workflow: create strategy → run backtest → poll result → return Sharpe."""
+    """Create strategy, run backtest, extract Sharpe."""
     pine_code = clean_pine_code(pine_code)
     strategy_name = generate_strategy_name()
 
-    # Step 1: Create the strategy
+    # Step 1: Create strategy
     print(f"Creating strategy '{strategy_name}'…")
-    try:
-        result = await session.call_tool(
-            "create_strategy",
-            arguments={
-                "name": strategy_name,
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "pineSource": pine_code
-            }
-        )
-        if not result.content or len(result.content) == 0:
-            print("Create strategy returned empty.")
-            return 0.0
-
-        text = result.content[0].text
-        print(f"Create response: {text[:300]}")
-
-        # Check for error
-        if "error" in text.lower():
-            print(f"Create strategy failed: {text[:200]}")
-            return 0.0
-
-        # Extract strategy ID
-        strategy_id = None
-        try:
-            data = json.loads(text)
-            strategy_id = data.get("id") or data.get("strategyId") or data.get("strategy_id")
-        except:
-            pass
-        if not strategy_id:
-            # Try to find any ID-like field
-            match = re.search(r'"id"\s*:\s*"([^"]+)"', text)
-            if match:
-                strategy_id = match.group(1)
-        if not strategy_id:
-            print("Could not extract strategy ID.")
-            return 0.0
-
-        print(f"Strategy ID: {strategy_id}")
-    except Exception as e:
-        print(f"Create strategy error: {e}")
+    result = await session.call_tool(
+        "create_strategy",
+        arguments={"name": strategy_name, "symbol": symbol, "timeframe": timeframe, "pineSource": pine_code}
+    )
+    if not result.content:
         return 0.0
+    text = result.content[0].text
+    if "error" in text.lower():
+        print(f"Create error: {text[:200]}")
+        return 0.0
+
+    data = json.loads(text)
+    strategy_id = data.get("id")
+    print(f"Strategy ID: {strategy_id}")
 
     # Step 2: Run backtest
-    print(f"Running backtest for {strategy_id}…")
-    try:
-        result = await session.call_tool(
-            "run_backtest",
-            arguments={"strategyId": strategy_id}
-        )
-        if not result.content or len(result.content) == 0:
-            print("Run backtest returned empty.")
-            return 0.0
-
-        text = result.content[0].text
-        print(f"Run backtest response: {text[:300]}")
-
-        if "error" in text.lower():
-            print(f"Run backtest failed: {text[:200]}")
-            return 0.0
-
-        # Extract job ID
-        job_id = None
-        try:
-            data = json.loads(text)
-            job_id = data.get("jobId") or data.get("id") or data.get("job_id")
-        except:
-            pass
-        if not job_id:
-            match = re.search(r'"jobId"\s*:\s*"([^"]+)"', text)
-            if match:
-                job_id = match.group(1)
-        if not job_id:
-            print("Could not extract job ID, trying to get result directly…")
-            # Some APIs return the result immediately
-            return extract_sharpe(text)
-
-        print(f"Job ID: {job_id}")
-    except Exception as e:
-        print(f"Run backtest error: {e}")
+    print("Running backtest…")
+    result = await session.call_tool("run_backtest", arguments={"strategyId": strategy_id})
+    if not result.content:
+        return 0.0
+    text = result.content[0].text
+    if "error" in text.lower():
+        print(f"Backtest error: {text[:300]}")
         return 0.0
 
+    data = json.loads(text)
+    print(f"Backtest response keys: {list(data.keys())}")
+
+    # Try to extract Sharpe from the inline result first
+    sharpe = extract_sharpe(text)
+    if sharpe != 0.0:
+        print(f"Sharpe found inline: {sharpe:.3f}")
+        return sharpe
+
+    # If no Sharpe inline, get the jobId and poll
+    job_id = data.get("jobId")
+    if not job_id:
+        # Try nested result
+        result_obj = data.get("result", {})
+        if isinstance(result_obj, dict):
+            job_id = result_obj.get("jobId")
+            # Also try extracting Sharpe from the nested result
+            sharpe = extract_sharpe(json.dumps(result_obj))
+            if sharpe != 0.0:
+                print(f"Sharpe found in nested result: {sharpe:.3f}")
+                return sharpe
+
+    if not job_id:
+        # Try resultId as fallback (some APIs use this)
+        job_id = data.get("resultId") or (data.get("result", {}).get("id") if isinstance(data.get("result"), dict) else None)
+
+    if not job_id:
+        print("No jobId or resultId found in response.")
+        return 0.0
+
+    print(f"Job ID: {job_id}")
+
     # Step 3: Poll for result
-    print(f"Polling for result of job {job_id}…")
-    for attempt in range(15):
-        await asyncio.sleep(2)
-        try:
-            result = await session.call_tool(
-                "get_backtest_result",
-                arguments={"jobId": job_id}
-            )
-            if result.content and len(result.content) > 0:
-                text = result.content[0].text
-                if "USER HINT" in text or "pending" in text.lower() or "running" in text.lower():
-                    print(f"  Attempt {attempt+1}: still running…")
-                    continue
-                if "error" in text.lower():
-                    print(f"Backtest error: {text[:300]}")
-                    return 0.0
-                print(f"Result: {text[:400]}")
-                return extract_sharpe(text)
-        except Exception as e:
-            print(f"Poll error: {e}")
-    print("Backtest timed out.")
+    for attempt in range(10):
+        await asyncio.sleep(3)
+        print(f"  Polling attempt {attempt+1}…")
+        result = await session.call_tool("get_backtest_result", arguments={"jobId": job_id})
+        if result.content:
+            text = result.content[0].text
+            if "not_found" in text.lower():
+                print("  Job not found, may have expired.")
+                return 0.0
+            if "error" in text.lower():
+                print(f"  Error: {text[:200]}")
+                continue
+            sharpe = extract_sharpe(text)
+            if sharpe != 0.0:
+                print(f"  Sharpe found: {sharpe:.3f}")
+                return sharpe
+            print(f"  Response: {text[:200]}")
+
+    print("Polling timed out.")
     return 0.0
 
 # ---------- Gist helpers ----------
