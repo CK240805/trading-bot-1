@@ -1,9 +1,9 @@
 """
-Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + MCP (Trader.dev)
-- Watch list validated against real OANDA instruments
+Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + Trader.dev MCP
+- Connects to remote Trader.dev MCP server (SSE) for real backtesting/optimization
+- Watch list validated against OANDA instruments
 - Trade size automatically adjusted to OANDA minimums and $100 cap
-- Robust MCP error handling
-- NVIDIA rate‑limit protection
+- NVIDIA rate-limit protection
 """
 import os, json, time, logging, threading, asyncio
 from datetime import datetime
@@ -22,9 +22,9 @@ import oandapyV20.endpoints.pricing as pricing
 import oandapyV20.endpoints.trades as trades
 import oandapyV20.endpoints.accounts as accounts
 
-# MCP client
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+# MCP client (SSE transport)
+from mcp import ClientSession
+from mcp.client.sse import sse_client
 
 # NVIDIA LLM client
 from openai import OpenAI
@@ -46,11 +46,12 @@ OANDA_API_KEY = os.getenv("OANDA_API_KEY")
 OANDA_ENV = os.getenv("OANDA_ENV", "practice")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-MCP_SERVER_COMMAND = os.getenv("MCP_SERVER_COMMAND", "python")
-MCP_SERVER_ARGS = os.getenv("MCP_SERVER_ARGS", "mcp_server.py").split()
 ALLOCATED_CAPITAL = 100.0
 
-TRADERDEV_API_KEY = os.getenv("TRADERDEV_API_KEY")
+# Trader.dev MCP server URL (SSE endpoint)
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://mcp.trader.dev/sse")
+# Optional: force a specific backtest tool name
+MCP_BACKTEST_TOOL = os.getenv("MCP_BACKTEST_TOOL")
 
 # NVIDIA client
 llm_client = OpenAI(
@@ -97,7 +98,6 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
         return completion.choices[0].message.content
     except Exception as e:
         logger.error(f"LLM API error: {e}")
-        # If it's a rate limit, set cooldown
         if "429" in str(e):
             LAST_LLM_CALL = now + LLM_COOLDOWN_SEC
         return ""
@@ -198,7 +198,6 @@ def adjust_units_to_instrument(instrument: str, desired_units: int, price: float
         abs_units = min_u
     if abs_units > max_u:
         abs_units = max_u
-    # Fit under $100
     max_allowed = int(ALLOCATED_CAPITAL / price)
     if max_allowed < min_u:
         logger.info(f"{instrument} min trade ${min_u*price:.2f} > $100, impossible.")
@@ -250,59 +249,107 @@ def tg_send_sync(text):
     else:
         asyncio.ensure_future(send_telegram_message(text))
 
-# ---------- MCP Optimizer (robust) ----------
+# ---------- LLM-Driven Strategy Optimizer (remote Trader.dev MCP via SSE) ----------
 class LLMStrategyOptimizer:
     def __init__(self):
+        self.best_strategy = None
         self.best_sharpe = -9999
+        self.mcp_url = MCP_SERVER_URL
+        self.tool_name = MCP_BACKTEST_TOOL
+
+    async def _find_backtest_tool(self, session) -> str:
+        """Return the name of the first tool that contains 'backtest', or the env-specified one."""
+        tools = await session.list_tools()
+        logger.info(f"Available MCP tools: {[t.name for t in tools]}")
+        if self.tool_name:
+            if any(t.name == self.tool_name for t in tools):
+                return self.tool_name
+            else:
+                logger.error(f"Specified tool '{self.tool_name}' not found.")
+                return None
+        for t in tools:
+            if "backtest" in t.name.lower():
+                logger.info(f"Auto-selected backtest tool: {t.name}")
+                return t.name
+        logger.error("No backtest tool found on MCP server.")
+        return None
 
     async def _call_mcp_backtest(self, strategy: dict, instrument="EUR_USD", timeframe="H1") -> float:
-        server_params = StdioServerParameters(command=MCP_SERVER_COMMAND, args=MCP_SERVER_ARGS)
         try:
-            async with stdio_client(server_params) as (read, write):
+            async with sse_client(self.mcp_url) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
-                    tools = await session.list_tools()
-                    if not any(t.name == "backtest_strategy" for t in tools):
-                        logger.error("MCP missing backtest_strategy tool.")
+                    tool_name = await self._find_backtest_tool(session)
+                    if not tool_name:
                         return 0.0
+
+                    # Call the backtest tool – adjust arguments as needed by Trader.dev's tool
                     result = await session.call_tool(
-                        "backtest_strategy",
-                        arguments={"strategy": strategy, "instrument": instrument, "timeframe": timeframe}
+                        tool_name,
+                        arguments={
+                            "strategy": strategy,
+                            "instrument": instrument,
+                            "timeframe": timeframe
+                            # Add other required fields if the tool expects them:
+                            # "start_date": "2024-01-01", "end_date": "2025-01-01"
+                        }
                     )
                     if result.content and len(result.content) > 0:
-                        return float(result.content[0].text)
+                        text = result.content[0].text
+                        try:
+                            # Try to parse JSON for a structured response
+                            data = json.loads(text)
+                            # Extract Sharpe – adapt these keys to actual response
+                            sharpe = data.get("sharpe") or data.get("sharpe_ratio") or \
+                                     data.get("performance", {}).get("sharpe") or 0.0
+                            return float(sharpe)
+                        except:
+                            # Fallback to plain text number
+                            return float(text)
                     return 0.0
         except Exception as e:
-            logger.error(f"MCP backtest failed: {e}")
+            logger.error(f"MCP backtest error: {e}")
             return 0.0
 
     async def run_optimization_loop(self):
-        system = "You are a quant strategist. Output a JSON strategy for EUR/USD H1. Only JSON."
-        user = "Propose an initial trading strategy."
+        system = (
+            "You are a quant strategist. Output a JSON strategy object that Trader.dev can backtest. "
+            "Example: {\"type\": \"sma_crossover\", \"fast_ma\": 10, \"slow_ma\": 30, \"stop_loss_pct\": 2}. "
+            "You can vary any values. Only JSON."
+        )
+        user = "Propose an initial trading strategy for EUR/USD H1."
         response = deepseek_chat(user, system)
         if not response:
             return
         try:
-            strat = json.loads(response)
+            current_strategy = json.loads(response)
         except:
             return
-        for i in range(5):  # reduced iterations to save API calls
-            sharpe = await self._call_mcp_backtest(strat)
-            logger.info(f"Iteration {i+1} Sharpe = {sharpe:.3f}")
+
+        for i in range(5):
+            logger.info(f"Iteration {i+1}: Testing strategy...")
+            sharpe = await self._call_mcp_backtest(current_strategy)
+            logger.info(f"Sharpe = {sharpe:.3f}")
+
             if sharpe > self.best_sharpe:
                 self.best_sharpe = sharpe
+                self.best_strategy = current_strategy
                 if sharpe >= 2.0:
                     logger.info("Amazing strategy found!")
                     break
-            # Improve
-            prompt = f"Improve this strategy (Sharpe {sharpe:.3f}): {json.dumps(strat)}"
-            response = deepseek_chat(prompt, system)
+
+            improvement_prompt = (
+                f"The last strategy (Sharpe {sharpe:.3f}) was: {json.dumps(current_strategy)}. "
+                "Propose an improved version. Only JSON."
+            )
+            response = deepseek_chat(improvement_prompt, system)
             if not response:
                 break
             try:
-                strat = json.loads(response)
+                current_strategy = json.loads(response)
             except:
                 break
+        logger.info(f"Optimization ended. Best Sharpe: {self.best_sharpe:.3f}")
 
 llm_strategy_optimizer = LLMStrategyOptimizer()
 
