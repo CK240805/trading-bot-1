@@ -1,0 +1,32 @@
+name: Pre‑Trading Optimization
+
+on:
+  schedule:
+    # Runs every day at 05:00 UTC (before the trading bot starts)
+    - cron: '0 5 * * *'
+  workflow_dispatch:   # allows manual trigger from GitHub UI
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install openai mcp requests
+
+      - name: Run optimization
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL || 'deepseek-ai/deepseek-v4-flash' }}
+          MCP_SERVER_URL: ${{ secrets.MCP_SERVER_URL || 'https://mcp.trader.dev/sse' }}
+          TRADERDEV_API_KEY: ${{ secrets.TRADERDEV_API_KEY }}
+          GITHUB_GIST_TOKEN: ${{ secrets.GIST_PAT }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: python optimize_strategies.py
