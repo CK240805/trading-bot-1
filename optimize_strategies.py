@@ -75,11 +75,9 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
 
 # ---------- Pine Script helpers ----------
 def clean_pine_code(code: str) -> str:
-    """Remove markdown fences and ensure version 6."""
-    # Remove markdown code fences
+    """Remove markdown fences, ensure version 6, strip non‑ASCII."""
     if "```" in code:
         parts = code.split("```")
-        # Take the first code block
         for part in parts:
             part = part.strip()
             if part.lower().startswith("pine"):
@@ -87,23 +85,70 @@ def clean_pine_code(code: str) -> str:
             if part.startswith("//@version"):
                 code = part
                 break
-
-    # Fix version directive
     code = re.sub(r'//@version\s*=\s*\d+', '//@version=6', code, count=1)
     if not code.strip().startswith('//@version'):
         code = '//@version=6\n' + code
-
-    # Remove any non‑ASCII box‑drawing characters that might slip in
     code = re.sub(r'[^\x00-\x7F]+', '', code)
-
     return code.strip()
 
 # ---------- MCP helpers ----------
+def extract_sharpe(text: str) -> float:
+    """Try every possible way to extract a Sharpe ratio from the response."""
+    # Try JSON
+    try:
+        data = json.loads(text)
+        # Common paths
+        for path in [
+            lambda d: d.get("sharpe"),
+            lambda d: d.get("sharpe_ratio"),
+            lambda d: d.get("performance", {}).get("sharpe"),
+            lambda d: d.get("performance", {}).get("sharpe_ratio"),
+            lambda d: d.get("result", {}).get("sharpe"),
+            lambda d: d.get("backtest", {}).get("sharpe"),
+            lambda d: d.get("metrics", {}).get("sharpe"),
+        ]:
+            try:
+                val = path(data)
+                if val is not None and float(val) != 0.0:
+                    return float(val)
+            except:
+                pass
+
+        # If data is a list, take first element
+        if isinstance(data, list) and len(data) > 0:
+            if isinstance(data[0], dict):
+                for path in [
+                    lambda d: d.get("sharpe"),
+                    lambda d: d.get("sharpe_ratio"),
+                ]:
+                    try:
+                        val = path(data[0])
+                        if val is not None and float(val) != 0.0:
+                            return float(val)
+                    except:
+                        pass
+    except:
+        pass
+
+    # Try plain number
+    try:
+        val = float(text.strip())
+        if val != 0.0:
+            return val
+    except:
+        pass
+
+    # Try regex for "sharpe": 1.23
+    match = re.search(r'sharpe["\']?\s*[:=]\s*([0-9.]+)', text, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+
+    return 0.0
+
 async def backtest_pine_script(session, pine_code: str, symbol: str, timeframe: str) -> float:
     pine_code = clean_pine_code(pine_code)
-    # Log first few lines for debugging
     lines = pine_code.split('\n')[:3]
-    print(f"Pine code preview: {lines}")
+    print(f"Pine preview: {lines}")
 
     try:
         result = await session.call_tool(
@@ -116,9 +161,10 @@ async def backtest_pine_script(session, pine_code: str, symbol: str, timeframe: 
         )
         if result.content and len(result.content) > 0:
             text = result.content[0].text
+            print(f"Raw response (first 600 chars):\n{text[:600]}\n")
+
             # Check for errors
             if any(err in text.lower() for err in ["error", "backtest_failed", "mcprule_rejected", "no_bars"]):
-                # Extract the message
                 try:
                     data = json.loads(text)
                     print(f"Backtest rejected: {data.get('message', text)[:200]}")
@@ -126,19 +172,10 @@ async def backtest_pine_script(session, pine_code: str, symbol: str, timeframe: 
                     print(f"Backtest rejected: {text[:200]}")
                 return 0.0
 
-            # Try to parse Sharpe
-            try:
-                data = json.loads(text)
-                sharpe = data.get("sharpe") or data.get("sharpe_ratio") or \
-                         data.get("performance", {}).get("sharpe")
-                if sharpe is not None:
-                    return float(sharpe)
-            except:
-                pass
-            try:
-                return float(text.strip())
-            except:
-                pass
+            sharpe = extract_sharpe(text)
+            return sharpe
+        else:
+            print("Empty response from backtest.")
         return 0.0
     except Exception as e:
         print(f"Backtest error: {e}")
@@ -200,12 +237,11 @@ async def main():
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            # Prompt for Pine Script v6 – NO platform rules (they contain box‑drawing chars)
             system = (
                 "You are a Pine Script expert. Write a COMPLETE and VALID Pine Script v6 strategy. "
                 "CRITICAL RULES:\n"
                 "1. First line MUST be exactly: //@version=6\n"
-                "2. Use study() or indicator() for the header.\n"
+                "2. Use strategy() for the header with overlay=true.\n"
                 "3. Include entry/exit logic with strategy.entry() and strategy.exit().\n"
                 "4. Use standard indicators: ta.sma, ta.rsi, ta.macd, etc.\n"
                 "5. Add stop‑loss and take‑profit.\n"
@@ -222,7 +258,7 @@ async def main():
             current_pine = clean_pine_code(response)
 
             for i in range(2):
-                print(f"Iteration {i+1}: Testing strategy…")
+                print(f"\nIteration {i+1}: Testing strategy…")
                 sharpe = await backtest_pine_script(session, current_pine, INSTRUMENT, TIMEFRAME)
                 print(f"  Sharpe = {sharpe:.3f}")
 
@@ -250,7 +286,7 @@ async def main():
                         break
                     current_pine = clean_pine_code(response)
 
-    print(f"🏁 Optimization finished. Best Sharpe: {best_sharpe:.3f}")
+    print(f"\n🏁 Optimization finished. Best Sharpe: {best_sharpe:.3f}")
 
 if __name__ == "__main__":
     asyncio.run(main())
