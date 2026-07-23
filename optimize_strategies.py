@@ -75,14 +75,10 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
 
 # ---------- AI selects instruments ----------
 def ai_pick_instruments() -> list:
-    """Ask DeepSeek to pick the best instruments to optimise right now."""
     system = (
         "You are a senior financial market analyst. "
-        "Based on current global market conditions, select the most important "
-        "instruments that would benefit from strategy optimization today. "
-        "Consider volatility, upcoming economic events, and recent trends. "
-        "Return ONLY a JSON array of OANDA instrument names (e.g. ['EUR_USD','XAU_USD','SPX500_USD']). "
-        "Pick exactly 5 instruments. No additional text."
+        "Select the 5 most important instruments to optimise trading strategies for today. "
+        "Return ONLY a JSON array of OANDA instrument names, e.g. ['EUR_USD','XAU_USD']."
     )
     prompt = "What are the top 5 instruments to optimise trading strategies for today?"
     response = deepseek_chat(prompt, system)
@@ -124,7 +120,6 @@ def clean_pine_code(code: str) -> str:
 
 def extract_sharpe(obj, depth=0):
     """Safely extract Sharpe from a dict, list, or raw text."""
-    # If obj is a string, try to parse JSON first
     if isinstance(obj, str):
         try:
             obj = json.loads(obj)
@@ -180,6 +175,7 @@ async def optimize_instrument(session, oanda_name: str, current_best: dict = Non
     name = f"github-{oanda_name}-{int(time.time())}"
 
     try:
+        # --- Create strategy ---
         result = await session.call_tool(
             "create_strategy",
             arguments={"name": name, "symbol": td_symbol, "timeframe": TIMEFRAME, "pineSource": pine_code}
@@ -191,10 +187,18 @@ async def optimize_instrument(session, oanda_name: str, current_best: dict = Non
             print(f"   ⚠️ Create error: {text[:150]}")
             return None
 
-        sid = json.loads(text).get("id")
+        # Safe JSON parse for strategy ID
+        try:
+            data = json.loads(text)
+        except Exception:
+            print(f"   ⚠️ Create response was not valid JSON (raw): {text[:200]}")
+            return None
+        sid = data.get("id")
         if not sid:
+            print("   ⚠️ No strategy ID in create response.")
             return None
 
+        # --- Run backtest ---
         result = await session.call_tool("run_backtest", arguments={"strategyId": sid})
         if not result.content:
             return None
@@ -203,9 +207,12 @@ async def optimize_instrument(session, oanda_name: str, current_best: dict = Non
             print(f"   ⚠️ Backtest error: {text[:150]}")
             return None
 
-        sharpe = extract_sharpe(text)   # now handles both JSON and raw strings
+        # Log raw response for debugging (first 500 chars)
+        print(f"   Raw backtest response: {text[:500]}")
+
+        sharpe = extract_sharpe(text)
         if sharpe is None:
-            print("   ⚠️ Could not extract Sharpe from response.")
+            print("   ⚠️ Could not extract Sharpe from response (see raw above).")
             return None
 
         print(f"   Sharpe = {sharpe:.3f}")
@@ -274,7 +281,6 @@ async def main():
     except:
         best_strategies = {}
 
-    # Let AI pick the instruments
     instruments = ai_pick_instruments()
     if not instruments:
         instruments = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
