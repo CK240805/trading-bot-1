@@ -105,43 +105,52 @@ def get_oanda_instruments() -> set:
         return {"BTC_USD", "ETH_USD", "LTC_USD", "BCH_USD", "XRP_USD"}
 
 async def get_traderdev_symbols(session) -> set:
-    """Fetch all available symbols from Trader.dev (Bybit USDT perps)."""
-    try:
-        # Search for common crypto symbols to get the full list
-        result = await session.call_tool("search_perps", arguments={"query": "USD"})
-        if not result.content:
-            return set()
-        text = result.content[0].text
-        data = json.loads(text)
-        if isinstance(data, list):
-            symbols = set()
-            for item in data:
-                if isinstance(item, dict) and "symbol" in item:
-                    symbols.add(item["symbol"])
-                elif isinstance(item, str):
-                    symbols.add(item)
-            return symbols
-        return set()
-    except Exception as e:
-        print(f"Failed to fetch Trader.dev symbols: {e}")
-        return set()
+    """
+    Fetch all available symbols from Trader.dev by probing common prefixes.
+    Returns a set of symbol strings (e.g., 'BTCUSDT', 'ETHUSDT').
+    """
+    # Common starting letters and prefixes for crypto perpetuals
+    search_terms = [
+        # Single letters cover most symbols
+        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+        "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+        # Popular coins explicitly
+        "BTC", "ETH", "XRP", "LTC", "BCH", "ADA", "SOL", "DOGE", "AVAX",
+        "DOT", "LINK", "UNI", "MATIC", "SHIB", "TRX", "ETC", "XLM", "ATOM"
+    ]
+    all_symbols = set()
+    for term in search_terms:
+        try:
+            result = await session.call_tool("search_perps", arguments={"query": term})
+            if result.content and result.content[0].text:
+                text = result.content[0].text
+                # The response could be JSON list of objects or just strings
+                data = json.loads(text)
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and "symbol" in item:
+                            all_symbols.add(item["symbol"])
+                        elif isinstance(item, str):
+                            all_symbols.add(item)
+        except Exception as e:
+            print(f"  (skipping term '{term}' due to error: {e})")
+        await asyncio.sleep(0.5)  # be gentle to the API
+    return all_symbols
 
 def match_instruments(oanda_set: set, traderdev_set: set) -> dict:
     """
     Cross‑match OANDA instruments with Trader.dev symbols.
     Returns a dict mapping OANDA name → Trader.dev symbol.
-    Example: {'BTC_USD': 'BTCUSDT', 'ETH_USD': 'ETHUSDT'}
     """
     matched = {}
     for oanda_name in oanda_set:
-        # OANDA crypto pairs usually end with _USD
         if not oanda_name.endswith("_USD"):
             continue
-        # Convert to Trader.dev format: BTC_USD → BTCUSDT
+        # Try USDT first
         td_candidate = oanda_name.replace("_USD", "USDT")
         if td_candidate in traderdev_set:
             matched[oanda_name] = td_candidate
-        # Also try without the T (BTCUSD) just in case
+        # Also try without T (e.g., BTCUSD)
         elif oanda_name.replace("_USD", "USD") in traderdev_set:
             matched[oanda_name] = oanda_name.replace("_USD", "USD")
     return matched
@@ -329,20 +338,20 @@ async def main():
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            # 1. Fetch Trader.dev symbols
-            print("📡 Fetching Trader.dev instruments…")
+            print("📡 Fetching Trader.dev instruments (this may take a few seconds)…")
             td_symbols = await get_traderdev_symbols(session)
             print(f"   Found {len(td_symbols)} symbols on Trader.dev.")
+            if td_symbols:
+                # Print a sample for verification
+                sample = sorted(list(td_symbols))[:20]
+                print(f"   Sample: {sample}")
 
-            # 2. Fetch OANDA instruments
             print("📡 Fetching OANDA instruments…")
             oanda_set = get_oanda_instruments()
             print(f"   Found {len(oanda_set)} instruments on OANDA.")
 
-            # 3. Cross‑match
             matched = match_instruments(oanda_set, td_symbols)
             if not matched:
-                # Fallback to known crypto pairs
                 print("⚠️ No matches found, using hardcoded crypto fallback.")
                 matched = {
                     "BTC_USD": "BTCUSDT",
@@ -355,7 +364,6 @@ async def main():
             for k, v in matched.items():
                 print(f"   {k} → {v}")
 
-            # 4. Optimize each matched instrument
             for oanda_name, td_symbol in matched.items():
                 current_best = best_strategies.get(oanda_name)
                 result = await optimize_instrument(session, oanda_name, td_symbol, current_best)
