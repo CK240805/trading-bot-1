@@ -2,9 +2,8 @@ name: Pre‑Trading Optimization
 
 on:
   schedule:
-    # Runs every day at 05:00 UTC (before the trading bot starts)
     - cron: '0 5 * * *'
-  workflow_dispatch:   # allows manual trigger from GitHub UI
+  workflow_dispatch:
 
 jobs:
   optimize:
@@ -19,7 +18,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install openai mcp requests
+        run: pip install openai mcp requests oandapyV20 six
 
       - name: Run optimization
         env:
@@ -29,4 +28,7 @@ jobs:
           TRADERDEV_API_KEY: ${{ secrets.TRADERDEV_API_KEY }}
           GITHUB_GIST_TOKEN: ${{ secrets.GIST_PAT }}
           GIST_ID: ${{ secrets.GIST_ID }}
+          OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+          OANDA_ENV: practice
         run: python optimize_strategies.py
