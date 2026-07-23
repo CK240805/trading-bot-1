@@ -406,6 +406,15 @@ def clean_pine_code(code: str) -> str:
     return code.strip()
 
 def extract_sharpe(obj, depth=0):
+    """Safely extract Sharpe from a dict, list, or raw text."""
+    if isinstance(obj, str):
+        try:
+            obj = json.loads(obj)
+        except:
+            match = re.search(r'sharpe["\']?\s*[:=]\s*([0-9.]+)', obj, re.IGNORECASE)
+            if match:
+                return float(match.group(1))
+            return None
     if depth > 10 or obj is None:
         return None
     if isinstance(obj, dict):
@@ -442,7 +451,13 @@ class LLMStrategyOptimizer:
         text = result.content[0].text
         if "error" in text.lower():
             return 0.0
-        sid = json.loads(text).get("id")
+        # Safe JSON parse
+        try:
+            data = json.loads(text)
+        except Exception:
+            logger.warning(f"create_strategy returned non‑JSON: {text[:200]}")
+            return 0.0
+        sid = data.get("id")
         if not sid:
             return 0.0
         result = await session.call_tool("run_backtest", arguments={"strategyId": sid})
@@ -451,7 +466,7 @@ class LLMStrategyOptimizer:
         text = result.content[0].text
         if "error" in text.lower():
             return 0.0
-        sharpe = extract_sharpe(json.loads(text))
+        sharpe = extract_sharpe(text)
         return sharpe if sharpe is not None else 0.0
 
     async def optimize_for_instrument(self, oanda_instrument: str):
@@ -604,7 +619,6 @@ def trading_decision():
 def refresh_watch_list_job():
     global CURRENT_WATCHLIST, OPTIMIZATION_QUEUE
     CURRENT_WATCHLIST = update_watch_list()
-    # Rebuild optimization queue with fresh watchlist
     OPTIMIZATION_QUEUE = list(CURRENT_WATCHLIST)
 
 def refresh_instruments_job():
@@ -619,7 +633,6 @@ def run_scheduler():
     update_valid_instruments()
     global CURRENT_WATCHLIST, OPTIMIZATION_QUEUE
     CURRENT_WATCHLIST = update_watch_list()
-    # Immediately fill the optimization queue with the watchlist
     OPTIMIZATION_QUEUE = list(CURRENT_WATCHLIST)
 
     schedule.every(5).minutes.do(mcp_optimization_runner)
@@ -646,7 +659,6 @@ async def startup():
     load_state()
     update_valid_instruments()
     CURRENT_WATCHLIST = update_watch_list()
-    # Immediately fill the optimization queue with the watchlist
     OPTIMIZATION_QUEUE = list(CURRENT_WATCHLIST)
     threading.Thread(target=run_scheduler, daemon=True).start()
     if not _STARTUP_MESSAGE_SENT:
