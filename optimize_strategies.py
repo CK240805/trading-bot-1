@@ -1,14 +1,18 @@
 """
 Pre‑trading strategy optimization – DeepSeek + Trader.dev MCP
-- Retries LLM calls on 429/503 errors
-- Passes symbol explicitly to run_backtest
-- Saves per‑instrument best strategies to a GitHub Gist
+Fetches instruments from Trader.dev and OANDA, cross‑matches them,
+and optimizes strategies only for matched (tradeable) instruments.
+Saves per‑instrument best strategies to a GitHub Gist.
 """
 import os, json, time, asyncio, requests, re
 from collections import deque
 from openai import OpenAI
 from mcp import ClientSession
 from mcp.client.sse import sse_client
+
+# OANDA (to fetch instrument list)
+from oandapyV20 import API
+import oandapyV20.endpoints.accounts as accounts
 
 # ---------- Config ----------
 NVIDIA_API_KEY = os.environ["NVIDIA_API_KEY"]
@@ -17,12 +21,16 @@ MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "https://mcp.trader.dev/sse")
 TRADERDEV_API_KEY = os.environ.get("TRADERDEV_API_KEY", "")
 GITHUB_GIST_TOKEN = os.environ["GITHUB_GIST_TOKEN"]
 GIST_ID = os.environ.get("GIST_ID")
+OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
+OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "")
+OANDA_ENV = os.environ.get("OANDA_ENV", "practice")
 
 TIMEFRAME = "1h"
 LLM_MAX_RETRIES = 5
-LLM_RETRY_DELAY = 10  # seconds between retries
+LLM_RETRY_DELAY = 10
 
 llm_client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY)
+oanda_api = API(access_token=OANDA_API_KEY, environment=OANDA_ENV) if OANDA_API_KEY else None
 
 # ---------- Rate limiter ----------
 _llm_call_timestamps = deque()
@@ -51,19 +59,16 @@ def _check_rate_limit() -> bool:
     _llm_call_timestamps.append(time.time())
     return True
 
-def deepseek_chat(prompt: str, system: str = "", retry: int = LLM_MAX_RETRIES) -> str:
-    """Call LLM with retry on 429/503 errors."""
+def deepseek_chat(prompt: str, system: str = "") -> str:
     global LAST_RATE_LIMIT
-    for attempt in range(retry):
+    for attempt in range(LLM_MAX_RETRIES):
         now = time.time()
         if now - LAST_RATE_LIMIT < RATE_LIMIT_COOLDOWN_SEC:
             wait = RATE_LIMIT_COOLDOWN_SEC - (now - LAST_RATE_LIMIT)
             print(f"LLM cooldown active, waiting {wait:.0f}s…")
             time.sleep(wait)
-
         if not _check_rate_limit():
             return ""
-
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -75,40 +80,71 @@ def deepseek_chat(prompt: str, system: str = "", retry: int = LLM_MAX_RETRIES) -
             )
             return resp.choices[0].message.content
         except Exception as e:
-            print(f"LLM API error (attempt {attempt+1}/{retry}): {e}")
+            print(f"LLM API error (attempt {attempt+1}/{LLM_MAX_RETRIES}): {e}")
             if "429" in str(e) or "503" in str(e):
                 LAST_RATE_LIMIT = time.time()
                 delay = LLM_RETRY_DELAY * (attempt + 1)
                 print(f"Retrying in {delay}s…")
                 time.sleep(delay)
             else:
-                break  # non‑retryable error
+                break
     return ""
 
-# ---------- AI selects instruments ----------
-def ai_pick_instruments() -> list:
-    system = (
-        "You are a senior financial market analyst. "
-        "Select the 5 most important instruments to optimise trading strategies for today. "
-        "Return ONLY a JSON array of OANDA instrument names, e.g. ['EUR_USD','XAU_USD']."
-    )
-    prompt = "What are the top 5 instruments to optimise trading strategies for today?"
-    response = deepseek_chat(prompt, system)
-    if not response:
-        return []
+# ---------- Fetch instruments ----------
+def get_oanda_instruments() -> set:
+    """Return a set of OANDA instrument names (e.g., EUR_USD, BTC_USD)."""
+    if not oanda_api or not OANDA_ACCOUNT_ID:
+        print("⚠️ OANDA credentials not set – using fallback list.")
+        return {"BTC_USD", "ETH_USD", "LTC_USD", "BCH_USD", "XRP_USD"}
     try:
-        if "```" in response:
-            response = response.split("```")[1].replace("json", "").strip()
-        instruments = json.loads(response)
-        if isinstance(instruments, list):
-            return instruments[:5]
-    except:
-        pass
-    return []
+        r = accounts.AccountInstruments(accountID=OANDA_ACCOUNT_ID)
+        resp = oanda_api.request(r)
+        return {instr["name"] for instr in resp.get("instruments", [])}
+    except Exception as e:
+        print(f"Failed to fetch OANDA instruments: {e}")
+        return {"BTC_USD", "ETH_USD", "LTC_USD", "BCH_USD", "XRP_USD"}
 
-# ---------- Symbol conversion ----------
-def oanda_to_traderdev_symbol(oanda_symbol: str) -> str:
-    return oanda_symbol.replace("_", "")
+async def get_traderdev_symbols(session) -> set:
+    """Fetch all available symbols from Trader.dev (Bybit USDT perps)."""
+    try:
+        # Search for common crypto symbols to get the full list
+        result = await session.call_tool("search_perps", arguments={"query": "USD"})
+        if not result.content:
+            return set()
+        text = result.content[0].text
+        data = json.loads(text)
+        if isinstance(data, list):
+            symbols = set()
+            for item in data:
+                if isinstance(item, dict) and "symbol" in item:
+                    symbols.add(item["symbol"])
+                elif isinstance(item, str):
+                    symbols.add(item)
+            return symbols
+        return set()
+    except Exception as e:
+        print(f"Failed to fetch Trader.dev symbols: {e}")
+        return set()
+
+def match_instruments(oanda_set: set, traderdev_set: set) -> dict:
+    """
+    Cross‑match OANDA instruments with Trader.dev symbols.
+    Returns a dict mapping OANDA name → Trader.dev symbol.
+    Example: {'BTC_USD': 'BTCUSDT', 'ETH_USD': 'ETHUSDT'}
+    """
+    matched = {}
+    for oanda_name in oanda_set:
+        # OANDA crypto pairs usually end with _USD
+        if not oanda_name.endswith("_USD"):
+            continue
+        # Convert to Trader.dev format: BTC_USD → BTCUSDT
+        td_candidate = oanda_name.replace("_USD", "USDT")
+        if td_candidate in traderdev_set:
+            matched[oanda_name] = td_candidate
+        # Also try without the T (BTCUSD) just in case
+        elif oanda_name.replace("_USD", "USD") in traderdev_set:
+            matched[oanda_name] = oanda_name.replace("_USD", "USD")
+    return matched
 
 # ---------- Pine Script helpers ----------
 def clean_pine_code(code: str) -> str:
@@ -156,10 +192,8 @@ def extract_sharpe(obj, depth=0):
     return None
 
 # ---------- Backtest workflow ----------
-async def optimize_instrument(session, oanda_name: str, current_best: dict = None) -> dict:
-    td_symbol = oanda_to_traderdev_symbol(oanda_name)
+async def optimize_instrument(session, oanda_name: str, td_symbol: str, current_best: dict = None) -> dict:
     current_sharpe = current_best.get("sharpe", -9999) if current_best else -9999
-
     print(f"\n📊 Optimizing {oanda_name} ({td_symbol})…")
     print(f"   Current best Sharpe: {current_sharpe:.3f}")
 
@@ -184,7 +218,6 @@ async def optimize_instrument(session, oanda_name: str, current_best: dict = Non
     name = f"github-{oanda_name}-{int(time.time())}"
 
     try:
-        # Create strategy – the symbol is sometimes ignored, but we still pass it
         result = await session.call_tool(
             "create_strategy",
             arguments={"name": name, "symbol": td_symbol, "timeframe": TIMEFRAME, "pineSource": pine_code}
@@ -205,14 +238,9 @@ async def optimize_instrument(session, oanda_name: str, current_best: dict = Non
         if not sid:
             return None
 
-        # Run backtest – explicitly pass symbol to override default
         result = await session.call_tool(
             "run_backtest",
-            arguments={
-                "strategyId": sid,
-                "symbol": td_symbol,           # explicitly set the symbol
-                "timeframe": TIMEFRAME          # and the timeframe
-            }
+            arguments={"strategyId": sid, "symbol": td_symbol, "timeframe": TIMEFRAME}
         )
         if not result.content:
             return None
@@ -274,7 +302,7 @@ def create_gist(data: dict) -> str:
 
 # ---------- Main ----------
 async def main():
-    print("🚀 Starting AI‑driven strategy optimization…")
+    print("🚀 Starting instrument‑matched strategy optimization…")
 
     gist_id = GIST_ID
     if not gist_id:
@@ -293,12 +321,6 @@ async def main():
     except:
         best_strategies = {}
 
-    instruments = ai_pick_instruments()
-    if not instruments:
-        instruments = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
-        print("AI selection failed, using default list.")
-    print(f"AI selected: {instruments}")
-
     headers = {}
     if TRADERDEV_API_KEY:
         headers["Authorization"] = f"Bearer {TRADERDEV_API_KEY}"
@@ -307,9 +329,36 @@ async def main():
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            for oanda_name in instruments:
+            # 1. Fetch Trader.dev symbols
+            print("📡 Fetching Trader.dev instruments…")
+            td_symbols = await get_traderdev_symbols(session)
+            print(f"   Found {len(td_symbols)} symbols on Trader.dev.")
+
+            # 2. Fetch OANDA instruments
+            print("📡 Fetching OANDA instruments…")
+            oanda_set = get_oanda_instruments()
+            print(f"   Found {len(oanda_set)} instruments on OANDA.")
+
+            # 3. Cross‑match
+            matched = match_instruments(oanda_set, td_symbols)
+            if not matched:
+                # Fallback to known crypto pairs
+                print("⚠️ No matches found, using hardcoded crypto fallback.")
+                matched = {
+                    "BTC_USD": "BTCUSDT",
+                    "ETH_USD": "ETHUSDT",
+                    "LTC_USD": "LTCUSDT",
+                    "BCH_USD": "BCHUSDT",
+                    "XRP_USD": "XRPUSDT"
+                }
+            print(f"🔗 Matched {len(matched)} instruments:")
+            for k, v in matched.items():
+                print(f"   {k} → {v}")
+
+            # 4. Optimize each matched instrument
+            for oanda_name, td_symbol in matched.items():
                 current_best = best_strategies.get(oanda_name)
-                result = await optimize_instrument(session, oanda_name, current_best)
+                result = await optimize_instrument(session, oanda_name, td_symbol, current_best)
 
                 if result and "pine" in result:
                     best_strategies[oanda_name] = result
@@ -320,7 +369,6 @@ async def main():
                         "last_optimized": time.strftime("%Y-%m-%dT%H:%M:%SZ")
                     })
 
-                # Wait between instruments to stay under API limits
                 await asyncio.sleep(5)
 
     print(f"\n🏁 Optimization finished. Strategies saved: {list(best_strategies.keys())}")
