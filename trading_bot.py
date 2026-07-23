@@ -1,5 +1,7 @@
 """
 Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + Trader.dev MCP
+- LLM calls retry up to 5 times on 429/503 errors
+- Passes symbol explicitly to run_backtest (prevents defaulting to BTCUSDT)
 - On startup, fills optimization queue with watchlist instruments
 - Optimizes strategies per instrument in the background every 5 minutes
 - Virtual budget ($100) with risk‑based position sizing (2% per trade)
@@ -86,13 +88,15 @@ CURRENT_WATCHLIST: List[str] = []
 VALID_INSTRUMENTS: Dict[str, dict] = {}
 _STARTUP_MESSAGE_SENT = False
 
-LAST_RATE_LIMIT = 0
-RATE_LIMIT_COOLDOWN_SEC = 120
-
+# ---------- Rate limiter & retry ----------
 _llm_call_timestamps = deque()
 MAX_CALLS_PER_MINUTE = 40
 RATE_LIMIT_WINDOW = 60
 RATE_LIMIT_WAIT_TIMEOUT = 5
+LAST_RATE_LIMIT = 0
+RATE_LIMIT_COOLDOWN_SEC = 120
+LLM_MAX_RETRIES = 5
+LLM_RETRY_DELAY = 10  # seconds base delay for exponential backoff
 
 DEFAULT_INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
 
@@ -174,31 +178,43 @@ def _check_rate_limit() -> bool:
     _llm_call_timestamps.append(time.time())
     return True
 
+# ---------- LLM call with retry ----------
 def deepseek_chat(prompt: str, system: str = "", category: str = "general") -> str:
+    """Call LLM with exponential backoff on 429/503 errors."""
     global LAST_RATE_LIMIT
-    now = time.time()
-    if now - LAST_RATE_LIMIT < RATE_LIMIT_COOLDOWN_SEC:
-        return ""
-    if not _check_rate_limit():
-        return ""
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    log_interaction(category, "bot", prompt)
-    try:
-        completion = llm_client.chat.completions.create(
-            model=LLM_MODEL, messages=messages,
-            temperature=1, top_p=0.95, max_tokens=16384, stream=False
-        )
-        response = completion.choices[0].message.content
-        log_interaction(category, "ai", response)
-        return response
-    except Exception as e:
-        logger.error(f"LLM API error: {e}")
-        if "429" in str(e) or "503" in str(e):
-            LAST_RATE_LIMIT = time.time()
-        return ""
+    for attempt in range(LLM_MAX_RETRIES):
+        now = time.time()
+        if now - LAST_RATE_LIMIT < RATE_LIMIT_COOLDOWN_SEC:
+            wait = RATE_LIMIT_COOLDOWN_SEC - (now - LAST_RATE_LIMIT)
+            logger.warning(f"LLM cooldown active, waiting {wait:.0f}s…")
+            time.sleep(wait)
+
+        if not _check_rate_limit():
+            return ""
+
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        log_interaction(category, "bot", prompt)
+        try:
+            completion = llm_client.chat.completions.create(
+                model=LLM_MODEL, messages=messages,
+                temperature=1, top_p=0.95, max_tokens=16384, stream=False
+            )
+            response = completion.choices[0].message.content
+            log_interaction(category, "ai", response)
+            return response
+        except Exception as e:
+            logger.error(f"LLM API error (attempt {attempt+1}/{LLM_MAX_RETRIES}): {e}")
+            if "429" in str(e) or "503" in str(e):
+                LAST_RATE_LIMIT = time.time()
+                delay = LLM_RETRY_DELAY * (attempt + 1)
+                logger.info(f"Retrying in {delay}s…")
+                time.sleep(delay)
+            else:
+                break  # non‑retryable error
+    return ""
 
 # ---------- Google News ----------
 def fetch_raw_headlines() -> str:
@@ -406,7 +422,6 @@ def clean_pine_code(code: str) -> str:
     return code.strip()
 
 def extract_sharpe(obj, depth=0):
-    """Safely extract Sharpe from a dict, list, or raw text."""
     if isinstance(obj, str):
         try:
             obj = json.loads(obj)
@@ -451,7 +466,6 @@ class LLMStrategyOptimizer:
         text = result.content[0].text
         if "error" in text.lower():
             return 0.0
-        # Safe JSON parse
         try:
             data = json.loads(text)
         except Exception:
@@ -460,7 +474,11 @@ class LLMStrategyOptimizer:
         sid = data.get("id")
         if not sid:
             return 0.0
-        result = await session.call_tool("run_backtest", arguments={"strategyId": sid})
+        # Pass symbol explicitly to override default
+        result = await session.call_tool(
+            "run_backtest",
+            arguments={"strategyId": sid, "symbol": symbol, "timeframe": timeframe}
+        )
         if not result.content:
             return 0.0
         text = result.content[0].text
