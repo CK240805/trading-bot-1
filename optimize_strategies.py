@@ -123,6 +123,18 @@ def clean_pine_code(code: str) -> str:
     return code.strip()
 
 def extract_sharpe(obj, depth=0):
+    """Safely extract Sharpe from a dict, list, or raw text."""
+    # If obj is a string, try to parse JSON first
+    if isinstance(obj, str):
+        try:
+            obj = json.loads(obj)
+        except:
+            # Regex fallback on string
+            match = re.search(r'sharpe["\']?\s*[:=]\s*([0-9.]+)', obj, re.IGNORECASE)
+            if match:
+                return float(match.group(1))
+            return None
+
     if depth > 10 or obj is None:
         return None
     if isinstance(obj, dict):
@@ -191,9 +203,10 @@ async def optimize_instrument(session, oanda_name: str, current_best: dict = Non
             print(f"   ⚠️ Backtest error: {text[:150]}")
             return None
 
-        sharpe = extract_sharpe(json.loads(text))
+        sharpe = extract_sharpe(text)   # now handles both JSON and raw strings
         if sharpe is None:
-            sharpe = 0.0
+            print("   ⚠️ Could not extract Sharpe from response.")
+            return None
 
         print(f"   Sharpe = {sharpe:.3f}")
 
@@ -264,7 +277,6 @@ async def main():
     # Let AI pick the instruments
     instruments = ai_pick_instruments()
     if not instruments:
-        # Fallback if LLM fails
         instruments = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
         print("AI selection failed, using default list.")
     print(f"AI selected: {instruments}")
