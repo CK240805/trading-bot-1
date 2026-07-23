@@ -121,6 +121,16 @@ def get_oanda_instruments() -> set:
         print(f"Failed to fetch OANDA instruments: {e}")
         return {"BTC_USD", "ETH_USD", "LTC_USD", "BCH_USD", "XRP_USD"}
 
+async def debug_search_perps(session):
+    """Test search_perps with 'BTC' and print raw response."""
+    try:
+        result = await mcp_call_tool_with_retry(session, "search_perps", {"query": "BTC"})
+        if result.content:
+            print("🔍 Raw search_perps response for 'BTC' (first 2000 chars):")
+            print(result.content[0].text[:2000])
+    except Exception as e:
+        print(f"Debug search failed: {e}")
+
 async def match_oanda_crypto_to_traderdev(session, oanda_set: set) -> dict:
     """
     For every OANDA crypto pair (ending with _USD), extract the base currency
@@ -138,8 +148,8 @@ async def match_oanda_crypto_to_traderdev(session, oanda_set: set) -> dict:
                 session, "search_perps", {"query": base}
             )
             if result.content and result.content[0].text:
-                data = json.loads(result.content[0].text)
-                # data is a list of objects with 'symbol' keys
+                text = result.content[0].text
+                data = json.loads(text)
                 symbols = []
                 if isinstance(data, list):
                     for item in data:
@@ -147,9 +157,9 @@ async def match_oanda_crypto_to_traderdev(session, oanda_set: set) -> dict:
                             symbols.append(item["symbol"])
                         elif isinstance(item, str):
                             symbols.append(item)
-                # We want a symbol that starts with the base and ends with USDT (perpetual)
+                # Try to find a symbol that contains the base (case‑insensitive) and ends with USDT
                 for sym in symbols:
-                    if sym.upper().startswith(base.upper()) and sym.upper().endswith("USDT"):
+                    if base.upper() in sym.upper() and sym.upper().endswith("USDT"):
                         matched[oanda_name] = sym
                         print(f"   ✅ Matched {oanda_name} → {sym}")
                         break
@@ -343,6 +353,9 @@ async def main():
     async with sse_client(MCP_SERVER_URL, headers=headers) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
+
+            # Debug: see what search_perps returns for BTC
+            await debug_search_perps(session)
 
             # 1. Fetch OANDA instruments
             print("📡 Fetching OANDA instruments…")
