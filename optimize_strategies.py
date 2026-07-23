@@ -1,8 +1,8 @@
 """
 Pre‑trading strategy optimization – DeepSeek + Trader.dev MCP
-DeepSeek selects the most promising instruments to optimize (based on
-current market conditions), then generates & backtests strategies for them.
-Saves per‑instrument best strategies to a GitHub Gist.
+- Retries LLM calls on 429/503 errors
+- Passes symbol explicitly to run_backtest
+- Saves per‑instrument best strategies to a GitHub Gist
 """
 import os, json, time, asyncio, requests, re
 from collections import deque
@@ -19,6 +19,8 @@ GITHUB_GIST_TOKEN = os.environ["GITHUB_GIST_TOKEN"]
 GIST_ID = os.environ.get("GIST_ID")
 
 TIMEFRAME = "1h"
+LLM_MAX_RETRIES = 5
+LLM_RETRY_DELAY = 10  # seconds between retries
 
 llm_client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY)
 
@@ -49,29 +51,39 @@ def _check_rate_limit() -> bool:
     _llm_call_timestamps.append(time.time())
     return True
 
-def deepseek_chat(prompt: str, system: str = "") -> str:
+def deepseek_chat(prompt: str, system: str = "", retry: int = LLM_MAX_RETRIES) -> str:
+    """Call LLM with retry on 429/503 errors."""
     global LAST_RATE_LIMIT
-    now = time.time()
-    if now - LAST_RATE_LIMIT < RATE_LIMIT_COOLDOWN_SEC:
-        print("LLM call skipped – cooldown active.")
-        return ""
-    if not _check_rate_limit():
-        return ""
-    messages = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
-    try:
-        resp = llm_client.chat.completions.create(
-            model=LLM_MODEL, messages=messages,
-            temperature=1, top_p=0.95, max_tokens=16384, stream=False
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        print(f"LLM API error: {e}")
-        if "429" in str(e) or "503" in str(e):
-            LAST_RATE_LIMIT = time.time()
-        return ""
+    for attempt in range(retry):
+        now = time.time()
+        if now - LAST_RATE_LIMIT < RATE_LIMIT_COOLDOWN_SEC:
+            wait = RATE_LIMIT_COOLDOWN_SEC - (now - LAST_RATE_LIMIT)
+            print(f"LLM cooldown active, waiting {wait:.0f}s…")
+            time.sleep(wait)
+
+        if not _check_rate_limit():
+            return ""
+
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        try:
+            resp = llm_client.chat.completions.create(
+                model=LLM_MODEL, messages=messages,
+                temperature=1, top_p=0.95, max_tokens=16384, stream=False
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            print(f"LLM API error (attempt {attempt+1}/{retry}): {e}")
+            if "429" in str(e) or "503" in str(e):
+                LAST_RATE_LIMIT = time.time()
+                delay = LLM_RETRY_DELAY * (attempt + 1)
+                print(f"Retrying in {delay}s…")
+                time.sleep(delay)
+            else:
+                break  # non‑retryable error
+    return ""
 
 # ---------- AI selects instruments ----------
 def ai_pick_instruments() -> list:
@@ -119,17 +131,14 @@ def clean_pine_code(code: str) -> str:
     return code.strip()
 
 def extract_sharpe(obj, depth=0):
-    """Safely extract Sharpe from a dict, list, or raw text."""
     if isinstance(obj, str):
         try:
             obj = json.loads(obj)
         except:
-            # Regex fallback on string
             match = re.search(r'sharpe["\']?\s*[:=]\s*([0-9.]+)', obj, re.IGNORECASE)
             if match:
                 return float(match.group(1))
             return None
-
     if depth > 10 or obj is None:
         return None
     if isinstance(obj, dict):
@@ -175,7 +184,7 @@ async def optimize_instrument(session, oanda_name: str, current_best: dict = Non
     name = f"github-{oanda_name}-{int(time.time())}"
 
     try:
-        # --- Create strategy ---
+        # Create strategy – the symbol is sometimes ignored, but we still pass it
         result = await session.call_tool(
             "create_strategy",
             arguments={"name": name, "symbol": td_symbol, "timeframe": TIMEFRAME, "pineSource": pine_code}
@@ -187,19 +196,24 @@ async def optimize_instrument(session, oanda_name: str, current_best: dict = Non
             print(f"   ⚠️ Create error: {text[:150]}")
             return None
 
-        # Safe JSON parse for strategy ID
         try:
             data = json.loads(text)
         except Exception:
-            print(f"   ⚠️ Create response was not valid JSON (raw): {text[:200]}")
+            print(f"   ⚠️ Create response not JSON: {text[:200]}")
             return None
         sid = data.get("id")
         if not sid:
-            print("   ⚠️ No strategy ID in create response.")
             return None
 
-        # --- Run backtest ---
-        result = await session.call_tool("run_backtest", arguments={"strategyId": sid})
+        # Run backtest – explicitly pass symbol to override default
+        result = await session.call_tool(
+            "run_backtest",
+            arguments={
+                "strategyId": sid,
+                "symbol": td_symbol,           # explicitly set the symbol
+                "timeframe": TIMEFRAME          # and the timeframe
+            }
+        )
         if not result.content:
             return None
         text = result.content[0].text
@@ -207,12 +221,10 @@ async def optimize_instrument(session, oanda_name: str, current_best: dict = Non
             print(f"   ⚠️ Backtest error: {text[:150]}")
             return None
 
-        # Log raw response for debugging (first 500 chars)
         print(f"   Raw backtest response: {text[:500]}")
-
         sharpe = extract_sharpe(text)
         if sharpe is None:
-            print("   ⚠️ Could not extract Sharpe from response (see raw above).")
+            print("   ⚠️ Could not extract Sharpe.")
             return None
 
         print(f"   Sharpe = {sharpe:.3f}")
@@ -308,7 +320,8 @@ async def main():
                         "last_optimized": time.strftime("%Y-%m-%dT%H:%M:%SZ")
                     })
 
-                await asyncio.sleep(2)
+                # Wait between instruments to stay under API limits
+                await asyncio.sleep(5)
 
     print(f"\n🏁 Optimization finished. Strategies saved: {list(best_strategies.keys())}")
 
