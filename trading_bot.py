@@ -1,6 +1,7 @@
 """
 Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + Trader.dev MCP
-- Optimizes strategies for EACH instrument in the dynamic watch list
+- On startup, fills optimization queue with watchlist instruments
+- Optimizes strategies per instrument in the background every 5 minutes
 - Virtual budget ($100) with risk‑based position sizing (2% per trade)
 - Saves state (budget, per‑instrument strategies) to GitHub Gist
 - Stops trading if budget reaches $0
@@ -69,9 +70,8 @@ if GITHUB_GIST_TOKEN:
 
 VIRTUAL_BALANCE = 100.0
 TRADING_PAUSED = False
-# Per‑instrument best strategies: {"EUR_USD": {"pine": "...", "sharpe": 2.4}, "XAU_USD": {...}}
 BEST_STRATEGIES: Dict[str, dict] = {}
-OPTIMIZATION_QUEUE: List[str] = []   # instruments waiting to be optimized
+OPTIMIZATION_QUEUE: List[str] = []
 CURRENT_OPTIMIZING: Optional[str] = None
 
 # ---------- NVIDIA client ----------
@@ -423,17 +423,7 @@ def extract_sharpe(obj, depth=0):
     return None
 
 def oanda_to_traderdev_symbol(oanda_symbol: str) -> str:
-    """Convert OANDA instrument names to Trader.dev format (e.g., EUR_USD → EURUSD)."""
     return oanda_symbol.replace("_", "")
-
-def traderdev_to_oanda_symbol(td_symbol: str) -> str:
-    """Convert Trader.dev symbol back to OANDA format."""
-    # Common patterns: EURUSD → EUR_USD, XAUUSD → XAU_USD, US30USD → US30_USD
-    # For indices: US30 → US30_USD, SPX500 → SPX500_USD
-    if td_symbol.endswith("USD") and len(td_symbol) > 3:
-        base = td_symbol[:-3]
-        return f"{base}_USD"
-    return td_symbol
 
 # ---------- Per‑instrument Optimizer ----------
 class LLMStrategyOptimizer:
@@ -442,8 +432,7 @@ class LLMStrategyOptimizer:
 
     async def _create_and_backtest(self, session, pine_code: str, symbol: str, timeframe: str = "1h") -> float:
         pine_code = clean_pine_code(pine_code)
-        name = f"opt-{symbol}-{int(time.time())}"
-        # Create strategy
+        name = f"live-{symbol}-{int(time.time())}"
         result = await session.call_tool(
             "create_strategy",
             arguments={"name": name, "symbol": symbol, "timeframe": timeframe, "pineSource": pine_code}
@@ -456,7 +445,6 @@ class LLMStrategyOptimizer:
         sid = json.loads(text).get("id")
         if not sid:
             return 0.0
-        # Run backtest
         result = await session.call_tool("run_backtest", arguments={"strategyId": sid})
         if not result.content:
             return 0.0
@@ -467,12 +455,10 @@ class LLMStrategyOptimizer:
         return sharpe if sharpe is not None else 0.0
 
     async def optimize_for_instrument(self, oanda_instrument: str):
-        """Generate and backtest a strategy for a single OANDA instrument."""
         global BEST_STRATEGIES, CURRENT_OPTIMIZING
         CURRENT_OPTIMIZING = oanda_instrument
-
         td_symbol = oanda_to_traderdev_symbol(oanda_instrument)
-        log_interaction("optimization", "system", f"Optimizing strategy for {oanda_instrument} ({td_symbol})…")
+        log_interaction("optimization", "system", f"Optimizing {oanda_instrument} ({td_symbol})…")
 
         headers = {}
         if TRADERDEV_API_KEY:
@@ -482,34 +468,24 @@ class LLMStrategyOptimizer:
             async with sse_client(MCP_SERVER_URL, headers=headers) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
-
-                    # Ask DeepSeek for a strategy specific to this instrument
                     system = (
-                        f"You are a Pine Script expert. Write a Pine Script v6 strategy specifically "
-                        f"for {td_symbol} on 1h timeframe. "
-                        "ONLY use: ta.sma, ta.ema, ta.rsi, ta.macd, ta.crossover, ta.crossunder, "
-                        "ta.highest, ta.lowest, ta.atr, ta.bb. "
-                        "First line: //@version=6. "
+                        f"Write a Pine Script v6 strategy for {td_symbol} on 1h. "
+                        "Only use: ta.sma, ta.ema, ta.rsi, ta.macd, ta.crossover, ta.crossunder, "
+                        "ta.highest, ta.lowest, ta.atr, ta.bb. //@version=6. "
                         "Use strategy() with pyramiding=1, default_qty_type=strategy.percent_of_equity, "
-                        "default_qty_value=100. Include entry/exit with stop loss and take profit. "
-                        "Output ONLY code, no markdown."
+                        "default_qty_value=100. Output ONLY code."
                     )
                     user = f"Write a Pine Script v6 strategy for {td_symbol} 1h."
-
                     response = deepseek_chat(user, system, category="optimization")
                     if not response:
                         CURRENT_OPTIMIZING = None
                         return
                     current_pine = clean_pine_code(response)
-
-                    # Test and improve (1 iteration to save API calls)
                     sharpe = await self._create_and_backtest(session, current_pine, td_symbol)
                     log_interaction("optimization", "system", f"{oanda_instrument} Sharpe = {sharpe:.3f}")
 
-                    # Get current best for this instrument
                     current_best = BEST_STRATEGIES.get(oanda_instrument, {})
                     current_best_sharpe = current_best.get("sharpe", -9999)
-
                     if sharpe > current_best_sharpe:
                         BEST_STRATEGIES[oanda_instrument] = {
                             "pine": current_pine,
@@ -520,30 +496,21 @@ class LLMStrategyOptimizer:
                         save_state()
                         log_interaction("optimization", "system",
                                         f"✅ New best for {oanda_instrument}: Sharpe = {sharpe:.3f}")
-                        if sharpe >= 2.0:
-                            log_interaction("optimization", "system",
-                                            f"🎉 Amazing strategy for {oanda_instrument}!")
         except Exception as e:
             logger.error(f"Optimization error for {oanda_instrument}: {e}")
         finally:
             CURRENT_OPTIMIZING = None
 
-# Global optimizer instance
 llm_strategy_optimizer = LLMStrategyOptimizer()
 
 def mcp_optimization_runner():
-    """Optimize the next instrument in the queue."""
     global OPTIMIZATION_QUEUE, CURRENT_OPTIMIZING
     if CURRENT_OPTIMIZING is not None:
-        return  # already optimizing
-
-    # Refresh the queue from the current watch list if empty
+        return
     if not OPTIMIZATION_QUEUE:
         OPTIMIZATION_QUEUE = list(CURRENT_WATCHLIST)
         if not OPTIMIZATION_QUEUE:
             return
-
-    # Pop the next instrument
     instrument = OPTIMIZATION_QUEUE.pop(0)
     try:
         asyncio.run(llm_strategy_optimizer.optimize_for_instrument(instrument))
@@ -576,7 +543,6 @@ def night_performance():
     pnl = float(summary.get("unrealizedPL", 0))
     balance = float(summary.get("balance", 0))
     open_text = "\n".join([f"{t['instrument']} {t['currentUnits']} @ {t['price']}" for t in trades_list])
-    # Show best strategies summary
     strat_summary = "\n".join([f"{k}: Sharpe={v.get('sharpe', 'N/A'):.3f}" for k, v in BEST_STRATEGIES.items()]) if BEST_STRATEGIES else "None"
     msg = (
         f"🌙 Night Report\n"
@@ -638,7 +604,7 @@ def trading_decision():
 def refresh_watch_list_job():
     global CURRENT_WATCHLIST, OPTIMIZATION_QUEUE
     CURRENT_WATCHLIST = update_watch_list()
-    # Rebuild optimization queue from new watch list
+    # Rebuild optimization queue with fresh watchlist
     OPTIMIZATION_QUEUE = list(CURRENT_WATCHLIST)
 
 def refresh_instruments_job():
@@ -653,9 +619,9 @@ def run_scheduler():
     update_valid_instruments()
     global CURRENT_WATCHLIST, OPTIMIZATION_QUEUE
     CURRENT_WATCHLIST = update_watch_list()
+    # Immediately fill the optimization queue with the watchlist
     OPTIMIZATION_QUEUE = list(CURRENT_WATCHLIST)
 
-    # Optimize every 5 minutes (picks one instrument from the queue)
     schedule.every(5).minutes.do(mcp_optimization_runner)
     schedule.every().day.at("07:00").do(morning_analysis)
     schedule.every().day.at("21:00").do(night_performance)
@@ -676,10 +642,12 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def startup():
-    global CURRENT_WATCHLIST, _STARTUP_MESSAGE_SENT
+    global CURRENT_WATCHLIST, OPTIMIZATION_QUEUE, _STARTUP_MESSAGE_SENT
     load_state()
     update_valid_instruments()
     CURRENT_WATCHLIST = update_watch_list()
+    # Immediately fill the optimization queue with the watchlist
+    OPTIMIZATION_QUEUE = list(CURRENT_WATCHLIST)
     threading.Thread(target=run_scheduler, daemon=True).start()
     if not _STARTUP_MESSAGE_SENT:
         strategies_count = len(BEST_STRATEGIES)
