@@ -99,7 +99,6 @@ def generate_strategy_name() -> str:
 
 # ---------- Sharpe extraction ----------
 def extract_sharpe(obj, depth=0):
-    """Recursively find any Sharpe-related value in a dict/list."""
     if depth > 10 or obj is None:
         return None
     if isinstance(obj, dict):
@@ -116,27 +115,11 @@ def extract_sharpe(obj, depth=0):
                 return r
     return None
 
-def get_sharpe_from_text(text: str) -> float:
-    """Extract Sharpe from a JSON string."""
-    try:
-        data = json.loads(text)
-        val = extract_sharpe(data)
-        if val is not None:
-            return val
-    except:
-        pass
-    match = re.search(r'sharpe["\']?\s*[:=]\s*([0-9.]+)', text, re.IGNORECASE)
-    if match:
-        return float(match.group(1))
-    return 0.0
-
-# ---------- Full backtest workflow ----------
+# ---------- Backtest workflow ----------
 async def create_and_backtest(session, pine_code: str, symbol: str, timeframe: str) -> float:
     pine_code = clean_pine_code(pine_code)
     strategy_name = generate_strategy_name()
 
-    # Step 1: Create strategy
-    print(f"Creating strategy '{strategy_name}'…")
     result = await session.call_tool(
         "create_strategy",
         arguments={"name": strategy_name, "symbol": symbol, "timeframe": timeframe, "pineSource": pine_code}
@@ -145,58 +128,28 @@ async def create_and_backtest(session, pine_code: str, symbol: str, timeframe: s
         return 0.0
     text = result.content[0].text
     if "error" in text.lower():
-        print(f"Create error: {text[:200]}")
         return 0.0
 
     data = json.loads(text)
     strategy_id = data.get("id")
-    print(f"Strategy ID: {strategy_id}")
 
-    # Step 2: Run backtest (result is inline)
-    print("Running backtest…")
     result = await session.call_tool("run_backtest", arguments={"strategyId": strategy_id})
     if not result.content:
         return 0.0
     text = result.content[0].text
     if "error" in text.lower():
-        print(f"Backtest error: {text[:300]}")
+        # Print the error so we can add more unsupported functions to the prompt
+        try:
+            err = json.loads(text)
+            print(f"  Backtest error: {err.get('message', text[:200])}")
+        except:
+            print(f"  Backtest error: {text[:200]}")
         return 0.0
 
-    # Parse the full response
     data = json.loads(text)
-
-    # First, try to find Sharpe in the entire response
     sharpe = extract_sharpe(data)
-    if sharpe is not None and sharpe != 0.0:
-        print(f"✅ Sharpe found: {sharpe:.3f}")
+    if sharpe is not None:
         return sharpe
-
-    # If not found, print the 'result' key to debug
-    result_obj = data.get("result", {})
-    if isinstance(result_obj, dict):
-        print(f"Result keys: {list(result_obj.keys())}")
-        # Print a sample of what's inside result
-        for k, v in result_obj.items():
-            if not isinstance(v, (dict, list)):
-                print(f"  {k}: {v}")
-        # Try to find Sharpe in nested result
-        sharpe = extract_sharpe(result_obj)
-        if sharpe is not None and sharpe != 0.0:
-            print(f"✅ Sharpe found in result: {sharpe:.3f}")
-            return sharpe
-
-    # If still not found, print the full response for debugging
-    print("⚠️ No Sharpe found. Full response keys:")
-    print(list(data.keys()))
-    # Check if there's a 'metrics' or 'totals' key
-    for key in ["metrics", "totals", "statistics", "performance"]:
-        if key in data:
-            print(f"Found '{key}' key: {json.dumps(data[key])[:300]}")
-            sharpe = extract_sharpe(data[key])
-            if sharpe is not None and sharpe != 0.0:
-                print(f"✅ Sharpe found in {key}: {sharpe:.3f}")
-                return sharpe
-
     return 0.0
 
 # ---------- Gist helpers ----------
@@ -255,14 +208,20 @@ async def main():
         async with ClientSession(read, write) as session:
             await session.initialize()
 
+            # Updated prompt with list of KNOWN SUPPORTED functions
             system = (
-                "You are a Pine Script expert. Write a COMPLETE Pine Script v6 strategy. "
-                "RULES:\n"
-                "1. First line MUST be: //@version=6\n"
+                "You are a Pine Script expert. Write a COMPLETE and VALID Pine Script v6 strategy.\n"
+                "CRITICAL RULES:\n"
+                "1. First line: //@version=6\n"
                 "2. Use strategy() with pyramiding=1, default_qty_type=strategy.percent_of_equity, default_qty_value=100\n"
                 "3. Include strategy.entry() and strategy.exit() with stop loss and take profit.\n"
-                "4. Use standard indicators: ta.sma, ta.rsi, ta.macd, ta.ema.\n"
-                "5. Output ONLY the code, no markdown, no explanations."
+                "4. ONLY use these supported functions (others will crash):\n"
+                "   ta.sma, ta.ema, ta.rsi, ta.macd, ta.crossover, ta.crossunder,\n"
+                "   ta.highest, ta.lowest, ta.atr, ta.stdev, ta.bb, ta.supertrend,\n"
+                "   request.security, math.abs, math.max, math.min\n"
+                "5. DO NOT use: ta.adx, ta.cci, ta.mfi, ta.obv, ta.stoch, ta.psar, ta.vwap,\n"
+                "   ta.wma, ta.vwma, ta.rma, ta.alma (these are NOT supported)\n"
+                "6. Output ONLY the code, no markdown, no explanations."
             )
             user = f"Write a Pine Script v6 strategy for {INSTRUMENT} {TIMEFRAME}."
 
@@ -293,8 +252,8 @@ async def main():
 
                 if i < 1:
                     prompt = (
-                        f"Pine Script achieved Sharpe={sharpe:.3f}. Improve it. Return ONLY improved v6 code.\n\n"
-                        f"Current:\n{current_pine}"
+                        f"Pine Script achieved Sharpe={sharpe:.3f}. Improve it using only supported functions. "
+                        f"Return ONLY improved v6 code.\n\nCurrent:\n{current_pine}"
                     )
                     response = deepseek_chat(prompt, system)
                     if not response:
