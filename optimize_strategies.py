@@ -121,16 +121,6 @@ def get_oanda_instruments() -> set:
         print(f"Failed to fetch OANDA instruments: {e}")
         return {"BTC_USD", "ETH_USD", "LTC_USD", "BCH_USD", "XRP_USD"}
 
-async def debug_search_perps(session):
-    """Test search_perps with 'BTC' and print raw response."""
-    try:
-        result = await mcp_call_tool_with_retry(session, "search_perps", {"query": "BTC"})
-        if result.content:
-            print("🔍 Raw search_perps response for 'BTC' (first 2000 chars):")
-            print(result.content[0].text[:2000])
-    except Exception as e:
-        print(f"Debug search failed: {e}")
-
 async def match_oanda_crypto_to_traderdev(session, oanda_set: set) -> dict:
     """
     For every OANDA crypto pair (ending with _USD), extract the base currency
@@ -150,19 +140,25 @@ async def match_oanda_crypto_to_traderdev(session, oanda_set: set) -> dict:
             if result.content and result.content[0].text:
                 text = result.content[0].text
                 data = json.loads(text)
-                symbols = []
                 if isinstance(data, list):
+                    # First pass: find exact baseCoin match
                     for item in data:
-                        if isinstance(item, dict) and "symbol" in item:
-                            symbols.append(item["symbol"])
-                        elif isinstance(item, str):
-                            symbols.append(item)
-                # Try to find a symbol that contains the base (case‑insensitive) and ends with USDT
-                for sym in symbols:
-                    if base.upper() in sym.upper() and sym.upper().endswith("USDT"):
-                        matched[oanda_name] = sym
-                        print(f"   ✅ Matched {oanda_name} → {sym}")
-                        break
+                        if isinstance(item, dict):
+                            wire = item.get("wire", "")
+                            base_coin = item.get("baseCoin", "")
+                            if base_coin.upper() == base.upper() and wire.upper().endswith("USDT"):
+                                matched[oanda_name] = wire
+                                print(f"   ✅ Matched {oanda_name} → {wire}")
+                                break
+                    else:
+                        # Second pass: fallback to any wire containing the base
+                        for item in data:
+                            if isinstance(item, dict):
+                                wire = item.get("wire", "")
+                                if base.upper() in wire.upper() and wire.upper().endswith("USDT"):
+                                    matched[oanda_name] = wire
+                                    print(f"   ⚠️ Fallback match {oanda_name} → {wire}")
+                                    break
         except Exception as e:
             print(f"   ⚠️ Could not search for {base}: {e}")
 
@@ -353,9 +349,6 @@ async def main():
     async with sse_client(MCP_SERVER_URL, headers=headers) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-
-            # Debug: see what search_perps returns for BTC
-            await debug_search_perps(session)
 
             # 1. Fetch OANDA instruments
             print("📡 Fetching OANDA instruments…")
