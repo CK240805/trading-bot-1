@@ -1,18 +1,13 @@
 """
 Autonomous Trading Bot – NVIDIA API (DeepSeek) + OANDA + Telegram + Trader.dev MCP
+- Optimizes strategies for EACH instrument in the dynamic watch list
 - Virtual budget ($100) with risk‑based position sizing (2% per trade)
-- Tracks realised P&L from closed trades, updates budget
-- Saves state (budget, best strategy, trading pause) to GitHub Gist
+- Saves state (budget, per‑instrument strategies) to GitHub Gist
 - Stops trading if budget reaches $0
 - Rate limiter: max 40 LLM calls per minute
-- Units sign enforced (SELL → negative, BUY → positive)
-- SL/TP validated on correct side of market
-- Live news from Google News RSS, analysed by DeepSeek
-- Order status correctly checked (FILL / CANCELLED / REJECTED)
-- MCP backtest via quick_backtest (corrected argument names)
 - Live dashboard at /dashboard
 """
-import os, json, time, logging, threading, asyncio
+import os, json, time, logging, threading, asyncio, re
 from datetime import datetime
 from typing import Optional, List, Dict
 from collections import deque
@@ -60,8 +55,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-ai/deepseek-v4-flash")
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "https://mcp.trader.dev/sse")
-MCP_BACKTEST_TOOL = os.getenv("MCP_BACKTEST_TOOL")      # optional
-TRADERDEV_API_KEY = os.getenv("TRADERDEV_API_KEY")      # for Trader.dev MCP auth
+TRADERDEV_API_KEY = os.getenv("TRADERDEV_API_KEY")
 
 # ---------- Gist state persistence ----------
 GIST_ID = os.getenv("GIST_ID")
@@ -73,11 +67,12 @@ if GITHUB_GIST_TOKEN:
         "Accept": "application/vnd.github.v3+json"
     }
 
-# ---------- Virtual budget & state ----------
-VIRTUAL_BALANCE = 100.0          # starting capital
-TRADING_PAUSED = False           # set to True when balance <= 0
-BEST_STRATEGY = None
-BEST_SHARPE = -9999
+VIRTUAL_BALANCE = 100.0
+TRADING_PAUSED = False
+# Per‑instrument best strategies: {"EUR_USD": {"pine": "...", "sharpe": 2.4}, "XAU_USD": {...}}
+BEST_STRATEGIES: Dict[str, dict] = {}
+OPTIMIZATION_QUEUE: List[str] = []   # instruments waiting to be optimized
+CURRENT_OPTIMIZING: Optional[str] = None
 
 # ---------- NVIDIA client ----------
 llm_client = OpenAI(
@@ -115,7 +110,6 @@ GOOGLE_NEWS_RSS_URL = (
     "?hl=en-US&gl=US&ceid=US:en"
 )
 
-# ---------- Interaction log ----------
 INTERACTION_LOG = deque(maxlen=200)
 
 def log_interaction(category: str, role: str, content: str):
@@ -130,11 +124,10 @@ def log_interaction(category: str, role: str, content: str):
 
 # ---------- Gist state persistence ----------
 def load_state():
-    global VIRTUAL_BALANCE, TRADING_PAUSED, BEST_STRATEGY, BEST_SHARPE
+    global VIRTUAL_BALANCE, TRADING_PAUSED, BEST_STRATEGIES
     if not GIST_ID or not GITHUB_GIST_TOKEN:
         logger.warning("Gist credentials not set – using defaults.")
         return
-
     try:
         resp = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=GIST_HEADERS)
         resp.raise_for_status()
@@ -143,9 +136,8 @@ def load_state():
         state = json.loads(content)
         VIRTUAL_BALANCE = state.get("virtual_balance", 100.0)
         TRADING_PAUSED = state.get("trading_paused", False)
-        BEST_STRATEGY = state.get("best_strategy")
-        BEST_SHARPE = state.get("best_sharpe", -9999)
-        logger.info(f"Loaded state from Gist: balance=${VIRTUAL_BALANCE:.2f}, paused={TRADING_PAUSED}")
+        BEST_STRATEGIES = state.get("best_strategies", {})
+        logger.info(f"Loaded state: balance=${VIRTUAL_BALANCE:.2f}, strategies={list(BEST_STRATEGIES.keys())}")
     except Exception as e:
         logger.error(f"Failed to load state from Gist: {e}")
 
@@ -155,8 +147,8 @@ def save_state():
     state = {
         "virtual_balance": VIRTUAL_BALANCE,
         "trading_paused": TRADING_PAUSED,
-        "best_strategy": BEST_STRATEGY,
-        "best_sharpe": BEST_SHARPE
+        "best_strategies": BEST_STRATEGIES,
+        "last_optimized": time.strftime("%Y-%m-%dT%H:%M:%SZ")
     }
     payload = {"files": {"bot_state.json": {"content": json.dumps(state, indent=2)}}}
     try:
@@ -164,7 +156,7 @@ def save_state():
     except Exception as e:
         logger.error(f"Failed to save state to Gist: {e}")
 
-# ---------- Rate limiter helper ----------
+# ---------- Rate limiter ----------
 def _check_rate_limit() -> bool:
     global _llm_call_timestamps
     now = time.time()
@@ -176,24 +168,18 @@ def _check_rate_limit() -> bool:
     oldest = _llm_call_timestamps[0]
     wait_time = oldest + RATE_LIMIT_WINDOW - now
     if wait_time > RATE_LIMIT_WAIT_TIMEOUT:
-        logger.warning("Rate limit reached, skipping LLM call (wait too long).")
         return False
-    logger.info(f"Rate limit reached, waiting {wait_time:.1f}s...")
     time.sleep(wait_time)
     _llm_call_timestamps.popleft()
     _llm_call_timestamps.append(time.time())
     return True
 
-# ---------- LLM call ----------
 def deepseek_chat(prompt: str, system: str = "", category: str = "general") -> str:
     global LAST_RATE_LIMIT
     now = time.time()
     if now - LAST_RATE_LIMIT < RATE_LIMIT_COOLDOWN_SEC:
-        logger.warning("LLM call skipped – rate limit cooldown active.")
-        log_interaction(category, "system", "LLM call blocked by cooldown.")
         return ""
     if not _check_rate_limit():
-        log_interaction(category, "system", "LLM call skipped due to rate limit.")
         return ""
     messages = []
     if system:
@@ -202,24 +188,19 @@ def deepseek_chat(prompt: str, system: str = "", category: str = "general") -> s
     log_interaction(category, "bot", prompt)
     try:
         completion = llm_client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            temperature=1,
-            top_p=0.95,
-            max_tokens=16384,
-            stream=False
+            model=LLM_MODEL, messages=messages,
+            temperature=1, top_p=0.95, max_tokens=16384, stream=False
         )
         response = completion.choices[0].message.content
         log_interaction(category, "ai", response)
         return response
     except Exception as e:
         logger.error(f"LLM API error: {e}")
-        log_interaction("error", "system", f"LLM error: {e}")
         if "429" in str(e) or "503" in str(e):
             LAST_RATE_LIMIT = time.time()
         return ""
 
-# ---------- Fetch raw headlines from Google News RSS ----------
+# ---------- Google News ----------
 def fetch_raw_headlines() -> str:
     global _last_raw_headlines, _last_raw_headlines_time
     now = time.time()
@@ -240,11 +221,9 @@ def fetch_raw_headlines() -> str:
         _last_raw_headlines = raw
         _last_raw_headlines_time = now
         return raw
-    except Exception as e:
-        logger.error(f"Failed to fetch Google News: {e}")
+    except:
         return ""
 
-# ---------- Get market news briefing ----------
 def get_news_briefing(force: bool = False) -> str:
     global _last_news_briefing, _last_news_briefing_time
     now = time.time()
@@ -253,21 +232,16 @@ def get_news_briefing(force: bool = False) -> str:
     raw_headlines = fetch_raw_headlines()
     if not raw_headlines:
         return _last_news_briefing if _last_news_briefing else ""
-    system = (
-        "You are a senior financial news analyst. Based on the headlines below, provide a concise "
-        "market briefing for a trader. Highlight key events, market sentiment, and potential impact on "
-        "forex, commodities, and indices. Keep it under 200 words."
-    )
-    prompt = f"Recent business headlines:\n{raw_headlines}\n\nProvide a briefing."
+    system = "Summarise these headlines into a concise briefing for a trader (under 200 words)."
+    prompt = f"Headlines:\n{raw_headlines}\n\nProvide briefing."
     briefing = deepseek_chat(prompt, system, category="news_analysis")
     if briefing:
         _last_news_briefing = briefing
         _last_news_briefing_time = now
         return briefing
-    else:
-        return raw_headlines
+    return raw_headlines
 
-# ---------- OANDA instruments ----------
+# ---------- OANDA ----------
 def get_valid_instruments() -> Dict[str, dict]:
     try:
         r = accounts.AccountInstruments(accountID=OANDA_ACCOUNT_ID)
@@ -278,10 +252,8 @@ def get_valid_instruments() -> Dict[str, dict]:
                 "minTradeSize": float(instr.get("minimumTradeSize", 1)),
                 "maxOrderUnits": float(instr.get("maximumOrderUnits", 1000000)),
             }
-        logger.info(f"Fetched {len(instruments)} valid instruments.")
         return instruments
-    except Exception as e:
-        logger.error(f"Instrument fetch error: {e}")
+    except:
         return {}
 
 def update_valid_instruments():
@@ -290,40 +262,26 @@ def update_valid_instruments():
     if not VALID_INSTRUMENTS:
         VALID_INSTRUMENTS = {i: {"minTradeSize": 1, "maxOrderUnits": 1000000} for i in DEFAULT_INSTRUMENTS}
 
-# ---------- Watch list ----------
 def update_watch_list() -> List[str]:
     if not VALID_INSTRUMENTS:
         update_valid_instruments()
     news_briefing = get_news_briefing(force=True)
-    system = "Select 5 OANDA instruments. Return ONLY a JSON array: ['EUR_USD','XAU_USD']"
-    prompt = f"Market briefing:\n{news_briefing}\n\nTime: {datetime.now().isoformat()}\nProvide JSON array." if news_briefing else f"Time: {datetime.now().isoformat()}\nProvide JSON array."
+    system = "Select 5 OANDA instruments. Return ONLY a JSON array."
+    prompt = f"Market briefing:\n{news_briefing}\nTime: {datetime.now().isoformat()}\nProvide JSON array." if news_briefing else f"Time: {datetime.now().isoformat()}\nProvide JSON array."
     response = deepseek_chat(prompt, system, category="watchlist")
     if not response:
-        return _filtered_default_watchlist()
+        return [i for i in DEFAULT_INSTRUMENTS if i in VALID_INSTRUMENTS][:5]
     try:
         if "```" in response:
             response = response.split("```")[1].replace("json", "")
         watchlist = json.loads(response.strip())
         if isinstance(watchlist, list):
             valid = [i for i in watchlist if i in VALID_INSTRUMENTS]
-            if len(valid) < 3:
-                return _filtered_default_watchlist()
-            while len(valid) < 5:
-                for d in DEFAULT_INSTRUMENTS:
-                    if d not in valid and d in VALID_INSTRUMENTS:
-                        valid.append(d)
-                        if len(valid) >= 5:
-                            break
-            logger.info(f"Watch list: {valid}")
-            return valid[:5]
+            return valid[:5] if valid else [i for i in DEFAULT_INSTRUMENTS if i in VALID_INSTRUMENTS][:5]
     except:
         pass
-    return _filtered_default_watchlist()
-
-def _filtered_default_watchlist():
     return [i for i in DEFAULT_INSTRUMENTS if i in VALID_INSTRUMENTS][:5]
 
-# ---------- OANDA helpers ----------
 def oanda_get_prices(instruments):
     params = {"instruments": ",".join(instruments)}
     r = pricing.PricingInfo(accountID=OANDA_ACCOUNT_ID, params=params)
@@ -331,14 +289,10 @@ def oanda_get_prices(instruments):
     prices = {}
     for p in resp.get("prices", []):
         if p["type"] == "PRICE":
-            prices[p["instrument"]] = {
-                "bid": float(p["bids"][0]["price"]),
-                "ask": float(p["asks"][0]["price"])
-            }
+            prices[p["instrument"]] = {"bid": float(p["bids"][0]["price"]), "ask": float(p["asks"][0]["price"])}
     return prices
 
 def calculate_position_size(instrument, price):
-    """Calculate maximum units based on 2% risk of virtual balance."""
     risk_amount = VIRTUAL_BALANCE * 0.02
     units = int(risk_amount / price)
     info = VALID_INSTRUMENTS.get(instrument)
@@ -355,92 +309,63 @@ def calculate_position_size(instrument, price):
         abs_units = int(VIRTUAL_BALANCE / price)
         if abs_units < min_u:
             return 0
-    return abs_units if units >= 0 else -abs_units
+    return abs_units
 
-def validate_sl_tp(direction: str, entry_price: float, sl: Optional[float], tp: Optional[float]) -> tuple:
+def validate_sl_tp(direction, entry, sl, tp):
     BUFFER = 0.0001
-    new_sl = sl
-    new_tp = tp
     if direction == "BUY":
-        if sl is not None and sl >= entry_price - BUFFER:
-            new_sl = None
-        if tp is not None and tp <= entry_price + BUFFER:
-            new_tp = None
-    elif direction == "SELL":
-        if sl is not None and sl <= entry_price + BUFFER:
-            new_sl = None
-        if tp is not None and tp >= entry_price - BUFFER:
-            new_tp = None
-    return new_sl, new_tp
+        if sl and sl >= entry - BUFFER:
+            sl = None
+        if tp and tp <= entry + BUFFER:
+            tp = None
+    else:
+        if sl and sl <= entry + BUFFER:
+            sl = None
+        if tp and tp >= entry - BUFFER:
+            tp = None
+    return sl, tp
 
 def oanda_place_order(instrument, units, sl=None, tp=None):
     direction = "BUY" if units > 0 else "SELL"
     prices = oanda_get_prices([instrument])
-    if instrument in prices:
-        entry = (prices[instrument]["bid"] + prices[instrument]["ask"]) / 2
-    else:
-        entry = 0.0
+    entry = (prices[instrument]["bid"] + prices[instrument]["ask"]) / 2 if instrument in prices else 0.0
     sl, tp = validate_sl_tp(direction, entry, sl, tp)
-    data = {"order": {
-        "type": "MARKET", "instrument": instrument,
-        "units": str(units), "timeInForce": "FOK"
-    }}
-    if sl is not None:
+    data = {"order": {"type": "MARKET", "instrument": instrument, "units": str(units), "timeInForce": "FOK"}}
+    if sl:
         data["order"]["stopLossOnFill"] = {"price": str(round(sl, 5))}
-    if tp is not None:
+    if tp:
         data["order"]["takeProfitOnFill"] = {"price": str(round(tp, 5))}
     try:
         resp = oanda_api.request(orders.OrderCreate(accountID=OANDA_ACCOUNT_ID, data=data))
         if "orderFillTransaction" in resp:
-            logger.info(f"✅ Order FILLED: {instrument} {units} units")
-            log_interaction("trade", "system", f"✅ Order FILLED: {instrument} {units} units")
+            log_interaction("trade", "system", f"✅ Order FILLED: {instrument} {units}")
             return resp
         elif "orderCancelTransaction" in resp:
             reason = resp["orderCancelTransaction"].get("reason", "unknown")
-            msg = f"❌ Order CANCELLED: {instrument} {units} units. Reason: {reason}"
-            logger.warning(msg)
-            log_interaction("trade", "system", msg)
-            tg_send_sync(msg)
+            log_interaction("trade", "system", f"❌ CANCELLED: {reason}")
         elif "orderRejectTransaction" in resp:
             reason = resp["orderRejectTransaction"].get("reason", "unknown")
-            msg = f"❌ Order REJECTED: {instrument} {units} units. Reason: {reason}"
-            logger.warning(msg)
-            log_interaction("trade", "system", msg)
-            tg_send_sync(msg)
-        else:
-            logger.info(f"Order response: {resp}")
-            log_interaction("trade", "system", f"Unknown order response: {resp}")
-        return None
+            log_interaction("trade", "system", f"❌ REJECTED: {reason}")
     except Exception as e:
-        logger.error(f"Order error: {e}")
         log_interaction("trade", "system", f"Order error: {e}")
-        return None
+    return None
 
-def oanda_get_closed_trades_since(last_id: int) -> list:
-    try:
-        resp = oanda_api.request(trades.TradesList(accountID=OANDA_ACCOUNT_ID, params={"state": "CLOSED", "count": 20}))
-        return resp.get("trades", [])
-    except Exception as e:
-        logger.error(f"Failed to fetch closed trades: {e}")
-        return []
+def oanda_get_open_trades():
+    return oanda_api.request(trades.OpenTrades(accountID=OANDA_ACCOUNT_ID)).get("trades", [])
+
+def oanda_get_account_summary():
+    return oanda_api.request(accounts.AccountSummary(accountID=OANDA_ACCOUNT_ID))["account"]
 
 def update_virtual_balance():
     global VIRTUAL_BALANCE, TRADING_PAUSED
-    closed_trades = oanda_get_closed_trades_since(0)
-    total_pnl = sum(float(t.get("realizedPL", 0)) for t in closed_trades)
+    closed = oanda_api.request(trades.TradesList(accountID=OANDA_ACCOUNT_ID, params={"state": "CLOSED", "count": 20})).get("trades", [])
+    total_pnl = sum(float(t.get("realizedPL", 0)) for t in closed)
     VIRTUAL_BALANCE = 100.0 + total_pnl
     if VIRTUAL_BALANCE <= 0:
         VIRTUAL_BALANCE = 0.0
         TRADING_PAUSED = True
-        tg_send_sync("🚫 Virtual budget depleted ($0). Trading paused indefinitely.")
+        tg_send_sync("🚫 Virtual budget depleted ($0). Trading paused.")
     save_state()
-
-def oanda_get_open_trades():
-    resp = oanda_api.request(trades.OpenTrades(accountID=OANDA_ACCOUNT_ID))
-    return resp.get("trades", [])
-
-def oanda_get_account_summary():
-    return oanda_api.request(accounts.AccountSummary(accountID=OANDA_ACCOUNT_ID))["account"]
 
 # ---------- Telegram ----------
 async def send_telegram_message(text):
@@ -460,135 +385,206 @@ def tg_send_sync(text):
     else:
         asyncio.ensure_future(send_telegram_message(text))
 
-# ---------- LLM-Driven Strategy Optimizer ----------
+# ---------- Pine Script helpers ----------
+def clean_pine_code(code: str) -> str:
+    if "```" in code:
+        parts = code.split("```")
+        for part in parts:
+            part = part.strip()
+            if part.lower().startswith("pine"):
+                part = part[4:].strip()
+            if part.startswith("//@version"):
+                code = part
+                break
+    code = re.sub(r'//@version\s*=\s*\d+', '//@version=6', code, count=1)
+    if not code.strip().startswith('//@version'):
+        code = '//@version=6\n' + code
+    code = re.sub(r'[^\x00-\x7F]+', '', code)
+    code = re.sub(r'pyramiding\s*=\s*\d+', 'pyramiding=1', code)
+    code = re.sub(r'default_qty_type\s*=\s*strategy\.\w+', 'default_qty_type=strategy.percent_of_equity', code)
+    code = re.sub(r'default_qty_value\s*=\s*\d+', 'default_qty_value=100', code)
+    return code.strip()
+
+def extract_sharpe(obj, depth=0):
+    if depth > 10 or obj is None:
+        return None
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if "sharpe" in k.lower() and isinstance(v, (int, float)):
+                return float(v)
+            r = extract_sharpe(v, depth + 1)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for item in obj:
+            r = extract_sharpe(item, depth + 1)
+            if r is not None:
+                return r
+    return None
+
+def oanda_to_traderdev_symbol(oanda_symbol: str) -> str:
+    """Convert OANDA instrument names to Trader.dev format (e.g., EUR_USD → EURUSD)."""
+    return oanda_symbol.replace("_", "")
+
+def traderdev_to_oanda_symbol(td_symbol: str) -> str:
+    """Convert Trader.dev symbol back to OANDA format."""
+    # Common patterns: EURUSD → EUR_USD, XAUUSD → XAU_USD, US30USD → US30_USD
+    # For indices: US30 → US30_USD, SPX500 → SPX500_USD
+    if td_symbol.endswith("USD") and len(td_symbol) > 3:
+        base = td_symbol[:-3]
+        return f"{base}_USD"
+    return td_symbol
+
+# ---------- Per‑instrument Optimizer ----------
 class LLMStrategyOptimizer:
     def __init__(self):
-        self.best_strategy = BEST_STRATEGY
-        self.best_sharpe = BEST_SHARPE
+        pass
 
-    async def _call_mcp_backtest(self, strategy: dict, instrument="EUR_USD", timeframe="H1") -> float:
+    async def _create_and_backtest(self, session, pine_code: str, symbol: str, timeframe: str = "1h") -> float:
+        pine_code = clean_pine_code(pine_code)
+        name = f"opt-{symbol}-{int(time.time())}"
+        # Create strategy
+        result = await session.call_tool(
+            "create_strategy",
+            arguments={"name": name, "symbol": symbol, "timeframe": timeframe, "pineSource": pine_code}
+        )
+        if not result.content:
+            return 0.0
+        text = result.content[0].text
+        if "error" in text.lower():
+            return 0.0
+        sid = json.loads(text).get("id")
+        if not sid:
+            return 0.0
+        # Run backtest
+        result = await session.call_tool("run_backtest", arguments={"strategyId": sid})
+        if not result.content:
+            return 0.0
+        text = result.content[0].text
+        if "error" in text.lower():
+            return 0.0
+        sharpe = extract_sharpe(json.loads(text))
+        return sharpe if sharpe is not None else 0.0
+
+    async def optimize_for_instrument(self, oanda_instrument: str):
+        """Generate and backtest a strategy for a single OANDA instrument."""
+        global BEST_STRATEGIES, CURRENT_OPTIMIZING
+        CURRENT_OPTIMIZING = oanda_instrument
+
+        td_symbol = oanda_to_traderdev_symbol(oanda_instrument)
+        log_interaction("optimization", "system", f"Optimizing strategy for {oanda_instrument} ({td_symbol})…")
+
         headers = {}
         if TRADERDEV_API_KEY:
             headers["Authorization"] = f"Bearer {TRADERDEV_API_KEY}"
+
         try:
             async with sse_client(MCP_SERVER_URL, headers=headers) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
-                    result = await session.call_tool(
-                        "quick_backtest",
-                        arguments={
-                            "symbol": instrument,
-                            "timeframe": timeframe,
-                            "strategy": strategy
-                        }
+
+                    # Ask DeepSeek for a strategy specific to this instrument
+                    system = (
+                        f"You are a Pine Script expert. Write a Pine Script v6 strategy specifically "
+                        f"for {td_symbol} on 1h timeframe. "
+                        "ONLY use: ta.sma, ta.ema, ta.rsi, ta.macd, ta.crossover, ta.crossunder, "
+                        "ta.highest, ta.lowest, ta.atr, ta.bb. "
+                        "First line: //@version=6. "
+                        "Use strategy() with pyramiding=1, default_qty_type=strategy.percent_of_equity, "
+                        "default_qty_value=100. Include entry/exit with stop loss and take profit. "
+                        "Output ONLY code, no markdown."
                     )
-                    if result.content and len(result.content) > 0:
-                        text = result.content[0].text
-                        try:
-                            data = json.loads(text)
-                            sharpe = data.get("sharpe") or data.get("sharpe_ratio") or \
-                                     data.get("performance", {}).get("sharpe") or 0.0
-                            return float(sharpe)
-                        except:
-                            return float(text)
-                    return 0.0
+                    user = f"Write a Pine Script v6 strategy for {td_symbol} 1h."
+
+                    response = deepseek_chat(user, system, category="optimization")
+                    if not response:
+                        CURRENT_OPTIMIZING = None
+                        return
+                    current_pine = clean_pine_code(response)
+
+                    # Test and improve (1 iteration to save API calls)
+                    sharpe = await self._create_and_backtest(session, current_pine, td_symbol)
+                    log_interaction("optimization", "system", f"{oanda_instrument} Sharpe = {sharpe:.3f}")
+
+                    # Get current best for this instrument
+                    current_best = BEST_STRATEGIES.get(oanda_instrument, {})
+                    current_best_sharpe = current_best.get("sharpe", -9999)
+
+                    if sharpe > current_best_sharpe:
+                        BEST_STRATEGIES[oanda_instrument] = {
+                            "pine": current_pine,
+                            "sharpe": sharpe,
+                            "symbol": td_symbol,
+                            "optimized_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        }
+                        save_state()
+                        log_interaction("optimization", "system",
+                                        f"✅ New best for {oanda_instrument}: Sharpe = {sharpe:.3f}")
+                        if sharpe >= 2.0:
+                            log_interaction("optimization", "system",
+                                            f"🎉 Amazing strategy for {oanda_instrument}!")
         except Exception as e:
-            if hasattr(e, 'exceptions'):
-                for sub_exc in e.exceptions:
-                    logger.error(f"MCP inner exception: {sub_exc}", exc_info=True)
-                    log_interaction("optimization", "system", f"MCP inner error: {sub_exc}")
-            else:
-                logger.error(f"MCP backtest error: {e}", exc_info=True)
-                log_interaction("optimization", "system", f"MCP backtest error: {e}")
-            return 0.0
+            logger.error(f"Optimization error for {oanda_instrument}: {e}")
+        finally:
+            CURRENT_OPTIMIZING = None
 
-    async def run_optimization_loop(self):
-        global BEST_STRATEGY, BEST_SHARPE
-        system = (
-            "You are a quant strategist. Output a JSON strategy object that Trader.dev can backtest. "
-            "Example: {\"type\": \"sma_crossover\", \"fast_ma\": 10, \"slow_ma\": 30, \"stop_loss_pct\": 2}. "
-            "Only JSON."
-        )
-        user = "Propose an initial trading strategy for EUR/USD H1."
-        response = deepseek_chat(user, system, category="optimization")
-        if not response:
-            return
-        try:
-            current_strategy = json.loads(response)
-        except:
-            return
-        for i in range(2):
-            log_interaction("optimization", "system", f"Iteration {i+1}: Testing strategy...")
-            sharpe = await self._call_mcp_backtest(current_strategy)
-            log_interaction("optimization", "system", f"Iteration {i+1} Sharpe = {sharpe:.3f}")
-            if sharpe > self.best_sharpe:
-                self.best_sharpe = sharpe
-                self.best_strategy = current_strategy
-                BEST_STRATEGY = current_strategy
-                BEST_SHARPE = sharpe
-                save_state()
-                if sharpe >= 2.0:
-                    log_interaction("optimization", "system", "🎉 Amazing strategy found!")
-                    break
-            improvement_prompt = (
-                f"The last strategy (Sharpe {sharpe:.3f}) was: {json.dumps(current_strategy)}. "
-                "Propose an improved version. Only JSON."
-            )
-            response = deepseek_chat(improvement_prompt, system, category="optimization")
-            if not response:
-                break
-            try:
-                current_strategy = json.loads(response)
-            except:
-                break
-        log_interaction("optimization", "system", f"Optimization ended. Best Sharpe: {self.best_sharpe:.3f}")
-
+# Global optimizer instance
 llm_strategy_optimizer = LLMStrategyOptimizer()
 
 def mcp_optimization_runner():
-    if not TRADING_PAUSED:
-        try:
-            asyncio.run(llm_strategy_optimizer.run_optimization_loop())
-        except Exception as e:
-            logger.error(f"Optimization loop error: {e}")
+    """Optimize the next instrument in the queue."""
+    global OPTIMIZATION_QUEUE, CURRENT_OPTIMIZING
+    if CURRENT_OPTIMIZING is not None:
+        return  # already optimizing
+
+    # Refresh the queue from the current watch list if empty
+    if not OPTIMIZATION_QUEUE:
+        OPTIMIZATION_QUEUE = list(CURRENT_WATCHLIST)
+        if not OPTIMIZATION_QUEUE:
+            return
+
+    # Pop the next instrument
+    instrument = OPTIMIZATION_QUEUE.pop(0)
+    try:
+        asyncio.run(llm_strategy_optimizer.optimize_for_instrument(instrument))
+    except Exception as e:
+        logger.error(f"Optimization runner error: {e}")
 
 # ---------- Scheduled Jobs ----------
-def update_balance_job():
-    update_virtual_balance()
-
 def morning_analysis():
     global CURRENT_WATCHLIST
     CURRENT_WATCHLIST = update_watch_list()
     if not CURRENT_WATCHLIST:
-        return tg_send_sync("🌅 Morning analysis skipped.")
+        return
     prices = oanda_get_prices(CURRENT_WATCHLIST)
     if not prices:
-        return tg_send_sync("🌅 OANDA data unavailable.")
+        return
     news_briefing = get_news_briefing(force=True)
-    news_block = f"\nMarket news briefing:\n{news_briefing}" if news_briefing else ""
+    news_block = f"\nMarket briefing:\n{news_briefing}" if news_briefing else ""
     prompt = f"Prices:\n{json.dumps(prices)}{news_block}\nGive a short market outlook."
     analysis = deepseek_chat(prompt, "You are a market analyst.", category="morning")
     if analysis:
-        tg_send_sync(f"🌅 Morning Analysis ({datetime.now().strftime('%Y-%m-%d')})\nWatch list: {', '.join(CURRENT_WATCHLIST)}\n\n{analysis}")
+        tg_send_sync(f"🌅 Morning Analysis\nWatch: {', '.join(CURRENT_WATCHLIST)}\n\n{analysis}")
 
 def night_performance():
     try:
         summary = oanda_get_account_summary()
-    except Exception as e:
-        return tg_send_sync(f"🌙 Night report error: {e}")
+    except:
+        return
     update_virtual_balance()
     trades_list = oanda_get_open_trades()
     pnl = float(summary.get("unrealizedPL", 0))
     balance = float(summary.get("balance", 0))
-    nav = float(summary.get("NAV", 0))
     open_text = "\n".join([f"{t['instrument']} {t['currentUnits']} @ {t['price']}" for t in trades_list])
+    # Show best strategies summary
+    strat_summary = "\n".join([f"{k}: Sharpe={v.get('sharpe', 'N/A'):.3f}" for k, v in BEST_STRATEGIES.items()]) if BEST_STRATEGIES else "None"
     msg = (
-        f"🌙 Night Report ({datetime.now().strftime('%Y-%m-%d')})\n"
+        f"🌙 Night Report\n"
         f"Virtual Budget: ${VIRTUAL_BALANCE:.2f}\n"
-        f"Real Account Balance: ${balance:.2f}\n"
+        f"Real Balance: ${balance:.2f}\n"
         f"Unrealized P&L: ${pnl:.2f}\n"
-        f"NAV: ${nav:.2f}\n"
-        f"Open Trades:\n{open_text or 'None'}"
+        f"Best Strategies:\n{strat_summary}\n"
+        f"Open:\n{open_text or 'None'}"
     )
     tg_send_sync(msg)
 
@@ -604,12 +600,12 @@ def trading_decision():
             return
         open_trades = oanda_get_open_trades()
         news_briefing = get_news_briefing()
-        news_block = f"\nMarket news briefing:\n{news_briefing}" if news_briefing else ""
-        system = f"""You are a trading bot. Trade only: {', '.join(CURRENT_WATCHLIST)}.
-Return JSON: {{"action":"BUY"|"SELL"|"HOLD","instrument":"...","units":1000,"stop_loss":...,"take_profit":...,"timeframe":"M5"}}.
-For BUY, units must be POSITIVE. For SELL, units must be NEGATIVE (e.g., -1000).
-You have a virtual budget of ${VIRTUAL_BALANCE:.2f}. Keep trade size appropriate.
-If HOLD, other fields null."""
+        news_block = f"\nMarket briefing:\n{news_briefing}" if news_briefing else ""
+        system = (
+            f"You are a trading bot. Trade only: {', '.join(CURRENT_WATCHLIST)}. "
+            "Return JSON: action (BUY/SELL/HOLD), instrument, units (negative for SELL), stop_loss, take_profit. "
+            f"Virtual budget: ${VIRTUAL_BALANCE:.2f}."
+        )
         user = f"Time: {datetime.now().isoformat()}\nPrices: {json.dumps(prices)}\nOpen: {json.dumps(open_trades)}{news_block}\nAction?"
         response = deepseek_chat(user, system, category="trade")
         if not response:
@@ -617,47 +613,49 @@ If HOLD, other fields null."""
         try:
             decision = json.loads(response)
         except:
-            log_interaction("trade", "system", "Failed to parse trade decision JSON.")
             return
         if decision.get("action") == "HOLD":
-            log_interaction("trade", "system", "AI decided HOLD.")
             return
         action = decision.get("action")
         instrument = decision.get("instrument")
-        desired_units = decision.get("units", 0)
-        if instrument not in CURRENT_WATCHLIST or desired_units == 0:
-            log_interaction("trade", "system", f"Invalid trade: {instrument} / {desired_units}")
+        units = decision.get("units", 0)
+        if instrument not in CURRENT_WATCHLIST or units == 0:
             return
-
-        if action == "SELL" and desired_units > 0:
-            desired_units = -abs(desired_units)
-        elif action == "BUY" and desired_units < 0:
-            desired_units = abs(desired_units)
-
+        if action == "SELL" and units > 0:
+            units = -abs(units)
+        elif action == "BUY" and units < 0:
+            units = abs(units)
         price = (prices[instrument]["bid"] + prices[instrument]["ask"]) / 2
         max_units = calculate_position_size(instrument, price)
         if max_units == 0:
-            log_interaction("trade", "system", "Position size zero, budget too small.")
             return
-        units = max_units if abs(desired_units) > max_units else abs(desired_units)
-        if action == "SELL":
-            units = -units
-
+        if abs(units) > max_units:
+            units = max_units if units > 0 else -max_units
         oanda_place_order(instrument, units, decision.get("stop_loss"), decision.get("take_profit"))
     except Exception as e:
         logger.exception(f"Trade error: {e}")
 
 def refresh_watch_list_job():
-    global CURRENT_WATCHLIST
+    global CURRENT_WATCHLIST, OPTIMIZATION_QUEUE
     CURRENT_WATCHLIST = update_watch_list()
+    # Rebuild optimization queue from new watch list
+    OPTIMIZATION_QUEUE = list(CURRENT_WATCHLIST)
 
 def refresh_instruments_job():
     update_valid_instruments()
+
+def update_balance_job():
+    update_virtual_balance()
 
 # ---------- Scheduler ----------
 def run_scheduler():
     load_state()
     update_valid_instruments()
+    global CURRENT_WATCHLIST, OPTIMIZATION_QUEUE
+    CURRENT_WATCHLIST = update_watch_list()
+    OPTIMIZATION_QUEUE = list(CURRENT_WATCHLIST)
+
+    # Optimize every 5 minutes (picks one instrument from the queue)
     schedule.every(5).minutes.do(mcp_optimization_runner)
     schedule.every().day.at("07:00").do(morning_analysis)
     schedule.every().day.at("21:00").do(night_performance)
@@ -673,7 +671,7 @@ def run_scheduler():
             logger.error(f"Scheduler error: {e}")
         time.sleep(1)
 
-# ---------- FastAPI & Dashboard ----------
+# ---------- FastAPI ----------
 app = FastAPI()
 
 @app.on_event("startup")
@@ -684,13 +682,17 @@ async def startup():
     CURRENT_WATCHLIST = update_watch_list()
     threading.Thread(target=run_scheduler, daemon=True).start()
     if not _STARTUP_MESSAGE_SENT:
-        await send_telegram_message(f"🤖 Bot started. Virtual budget: ${VIRTUAL_BALANCE:.2f}. Watch: {', '.join(CURRENT_WATCHLIST)}")
+        strategies_count = len(BEST_STRATEGIES)
+        await send_telegram_message(
+            f"🤖 Bot started. Budget: ${VIRTUAL_BALANCE:.2f}. "
+            f"Strategies: {strategies_count} optimized. Watch: {', '.join(CURRENT_WATCHLIST)}"
+        )
         _STARTUP_MESSAGE_SENT = True
 
 @app.get("/")
 @app.head("/")
 def root():
-    return {"message": "Trading bot running. Visit /dashboard for live interactions."}
+    return {"message": "Trading bot running."}
 
 @app.get("/health")
 def health():
@@ -698,7 +700,8 @@ def health():
         "status": "ok",
         "virtual_balance": VIRTUAL_BALANCE,
         "trading_paused": TRADING_PAUSED,
-        "best_sharpe": BEST_SHARPE,
+        "strategies": {k: {"sharpe": v.get("sharpe")} for k, v in BEST_STRATEGIES.items()},
+        "current_optimizing": CURRENT_OPTIMIZING,
         "watch_list": CURRENT_WATCHLIST
     }
 
@@ -709,55 +712,27 @@ def api_logs():
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Trading Bot Live</title>
-        <meta charset="utf-8">
-        <meta http-equiv="refresh" content="30">
-        <style>
-            body { font-family: monospace; background: #0a0a0a; color: #ccc; padding: 20px; }
-            h1 { color: #00ff88; }
-            .log { max-height: 80vh; overflow-y: auto; border: 1px solid #333; padding: 10px; background: #111; }
-            .entry { margin-bottom: 8px; border-bottom: 1px solid #222; padding-bottom: 5px; }
-            .time { color: #888; font-size: 0.85em; }
-            .role { font-weight: bold; }
-            .bot { color: #4da6ff; }
-            .ai { color: #ffaa00; }
-            .system { color: #888; }
-            .optimization { color: #af5fff; }
-            .watchlist { color: #5fd7ff; }
-            .trade { color: #ff6666; }
-            .error { color: #ff0000; }
-            pre { white-space: pre-wrap; margin: 4px 0; }
-        </style>
-    </head>
-    <body>
-        <h1>🤖 Trading Bot Live</h1>
-        <p>Virtual Budget: $<span id="balance">0.00</span> | Trading: <span id="paused">---</span></p>
-        <div class="log" id="log"></div>
-        <script>
-            async function load() {
-                const resp = await fetch('/api/logs');
-                const logs = await resp.json();
-                const logDiv = document.getElementById('log');
-                logDiv.innerHTML = logs.map(e => `
-                    <div class="entry">
-                        <span class="time">${e.time}</span>
-                        <span class="role ${e.role}">[${e.category}] ${e.role}:</span>
-                        <pre>${e.content}</pre>
-                    </div>`).join('');
-                const healthResp = await fetch('/health');
-                const health = await healthResp.json();
-                document.getElementById('balance').innerText = health.virtual_balance.toFixed(2);
-                document.getElementById('paused').innerText = health.trading_paused ? 'PAUSED' : 'ACTIVE';
-            }
-            load();
-            setInterval(load, 10000);
-        </script>
-    </body>
-    </html>
-    """
+    <!DOCTYPE html><html><head><title>Trading Bot Live</title><meta charset="utf-8"><meta http-equiv="refresh" content="30">
+    <style>body{font-family:monospace;background:#0a0a0a;color:#ccc;padding:20px}h1{color:#00ff88}
+    .log{max-height:80vh;overflow-y:auto;border:1px solid #333;padding:10px;background:#111}
+    .entry{margin-bottom:8px;border-bottom:1px solid #222;padding-bottom:5px}
+    .time{color:#888;font-size:.85em}.role{font-weight:bold}.bot{color:#4da6ff}.ai{color:#ffaa00}
+    .system{color:#888}.optimization{color:#af5fff}.trade{color:#ff6666}.error{color:#ff0000}
+    pre{white-space:pre-wrap;margin:4px 0}</style></head><body>
+    <h1>🤖 Trading Bot Live</h1><p>Budget: $<span id="bal">0</span> | Optimizing: <span id="opt">-</span></p>
+    <div id="strats"></div>
+    <div class="log" id="log"></div><script>async function load(){
+    const r=await fetch('/api/logs');const logs=await r.json();
+    document.getElementById('log').innerHTML=logs.map(e=>`<div class="entry"><span class="time">${e.time}</span>
+    <span class="role ${e.role}">[${e.category}] ${e.role}:</span><pre>${e.content}</pre></div>`).join('');
+    const h=await fetch('/health');const health=await h.json();
+    document.getElementById('bal').innerText=health.virtual_balance.toFixed(2);
+    document.getElementById('opt').innerText=health.current_optimizing||'idle';
+    const strats=health.strategies||{};
+    let s='<p>Best Strategies:</p><ul>';
+    for(const[k,v]of Object.entries(strats)){s+=`<li>${k}: Sharpe=${v.sharpe?.toFixed(3)||'N/A'}</li>`;}
+    s+='</ul>';document.getElementById('strats').innerHTML=s;
+    }load();setInterval(load,10000);</script></body></html>"""
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
