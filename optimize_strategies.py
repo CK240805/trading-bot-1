@@ -1,7 +1,7 @@
 """
 Pre‑trading strategy optimization – DeepSeek + Trader.dev MCP
-Fetches instruments from Trader.dev and OANDA, cross‑matches them,
-and optimizes strategies only for matched (tradeable) instruments.
+Dynamically cross‑matches OANDA crypto pairs with Trader.dev symbols
+by querying search_perps with each base currency.
 Saves per‑instrument best strategies to a GitHub Gist.
 """
 import os, json, time, asyncio, requests, re
@@ -29,7 +29,7 @@ TIMEFRAME = "1h"
 LLM_MAX_RETRIES = 5
 LLM_RETRY_DELAY = 10
 MCP_MAX_RETRIES = 3
-MCP_RETRY_DELAY = 5  # seconds base delay for MCP tool retries
+MCP_RETRY_DELAY = 5
 
 llm_client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY)
 oanda_api = API(access_token=OANDA_API_KEY, environment=OANDA_ENV) if OANDA_API_KEY else None
@@ -94,7 +94,6 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
 
 # ---------- MCP tool call with retry ----------
 async def mcp_call_tool_with_retry(session, tool_name: str, arguments: dict, max_retries: int = MCP_MAX_RETRIES, delay: int = MCP_RETRY_DELAY) -> dict:
-    """Call an MCP tool with retry on transient errors."""
     last_exception = None
     for attempt in range(max_retries):
         try:
@@ -110,7 +109,7 @@ async def mcp_call_tool_with_retry(session, tool_name: str, arguments: dict, max
 
 # ---------- Fetch instruments ----------
 def get_oanda_instruments() -> set:
-    """Return a set of OANDA instrument names (e.g., EUR_USD, BTC_USD)."""
+    """Return a set of OANDA instrument names."""
     if not oanda_api or not OANDA_ACCOUNT_ID:
         print("⚠️ OANDA credentials not set – using fallback list.")
         return {"BTC_USD", "ETH_USD", "LTC_USD", "BCH_USD", "XRP_USD"}
@@ -122,46 +121,41 @@ def get_oanda_instruments() -> set:
         print(f"Failed to fetch OANDA instruments: {e}")
         return {"BTC_USD", "ETH_USD", "LTC_USD", "BCH_USD", "XRP_USD"}
 
-async def get_traderdev_symbols(session) -> set:
+async def match_oanda_crypto_to_traderdev(session, oanda_set: set) -> dict:
     """
-    Fetch all available symbols from Trader.dev by probing common prefixes.
-    Returns a set of symbol strings (e.g., 'BTCUSDT', 'ETHUSDT').
+    For every OANDA crypto pair (ending with _USD), extract the base currency
+    and search Trader.dev for matching symbols. Returns a dict mapping
+    OANDA name → Trader.dev symbol (e.g. 'BTC_USD' → 'BTCUSDT').
     """
-    search_terms = [
-        "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
-        "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
-        "BTC", "ETH", "XRP", "LTC", "BCH", "ADA", "SOL", "DOGE", "AVAX",
-        "DOT", "LINK", "UNI", "MATIC", "SHIB", "TRX", "ETC", "XLM", "ATOM"
-    ]
-    all_symbols = set()
-    for term in search_terms:
+    matched = {}
+    oanda_crypto = [name for name in oanda_set if name.endswith("_USD")]
+
+    for oanda_name in oanda_crypto:
+        base = oanda_name.replace("_USD", "")  # e.g. "BTC"
+        print(f"   Searching Trader.dev for base '{base}'…")
         try:
-            result = await mcp_call_tool_with_retry(session, "search_perps", {"query": term})
+            result = await mcp_call_tool_with_retry(
+                session, "search_perps", {"query": base}
+            )
             if result.content and result.content[0].text:
-                text = result.content[0].text
-                data = json.loads(text)
+                data = json.loads(result.content[0].text)
+                # data is a list of objects with 'symbol' keys
+                symbols = []
                 if isinstance(data, list):
                     for item in data:
                         if isinstance(item, dict) and "symbol" in item:
-                            all_symbols.add(item["symbol"])
+                            symbols.append(item["symbol"])
                         elif isinstance(item, str):
-                            all_symbols.add(item)
+                            symbols.append(item)
+                # We want a symbol that starts with the base and ends with USDT (perpetual)
+                for sym in symbols:
+                    if sym.upper().startswith(base.upper()) and sym.upper().endswith("USDT"):
+                        matched[oanda_name] = sym
+                        print(f"   ✅ Matched {oanda_name} → {sym}")
+                        break
         except Exception as e:
-            print(f"  (skipping term '{term}' due to error: {e})")
-        await asyncio.sleep(0.5)
-    return all_symbols
+            print(f"   ⚠️ Could not search for {base}: {e}")
 
-def match_instruments(oanda_set: set, traderdev_set: set) -> dict:
-    """Cross‑match OANDA instruments with Trader.dev symbols."""
-    matched = {}
-    for oanda_name in oanda_set:
-        if not oanda_name.endswith("_USD"):
-            continue
-        td_candidate = oanda_name.replace("_USD", "USDT")
-        if td_candidate in traderdev_set:
-            matched[oanda_name] = td_candidate
-        elif oanda_name.replace("_USD", "USD") in traderdev_set:
-            matched[oanda_name] = oanda_name.replace("_USD", "USD")
     return matched
 
 # ---------- Pine Script helpers ----------
@@ -185,28 +179,19 @@ def clean_pine_code(code: str) -> str:
     return code.strip()
 
 def extract_sharpe(obj):
-    """
-    Extract Sharpe ratio from a string, dict, or list.
-    Searches for common key names: sharpe_ratio, sharpeRatio, sharpe.
-    """
-    # If it's a string, try JSON then regex
     if isinstance(obj, str):
         try:
             obj = json.loads(obj)
         except:
-            # Broad regex for any "sharpe*" key followed by a number
             matches = re.findall(r'"sharpe[^"]*"\s*:\s*([0-9.-]+)', obj, re.IGNORECASE)
             if matches:
                 return float(matches[0])
             return None
-
-    # Recursive search in dict/list
     def _search(o, depth=0):
         if depth > 10 or o is None:
             return None
         if isinstance(o, dict):
             for k, v in o.items():
-                # Case-insensitive partial match on key
                 if "sharpe" in k.lower() and isinstance(v, (int, float)):
                     return float(v)
                 r = _search(v, depth + 1)
@@ -218,7 +203,6 @@ def extract_sharpe(obj):
                 if r is not None:
                     return r
         return None
-
     return _search(obj)
 
 # ---------- Backtest workflow ----------
@@ -248,7 +232,6 @@ async def optimize_instrument(session, oanda_name: str, td_symbol: str, current_
     name = f"github-{oanda_name}-{int(time.time())}"
 
     try:
-        # --- Create strategy ---
         result = await mcp_call_tool_with_retry(
             session, "create_strategy",
             {"name": name, "symbol": td_symbol, "timeframe": TIMEFRAME, "pineSource": pine_code}
@@ -269,7 +252,6 @@ async def optimize_instrument(session, oanda_name: str, td_symbol: str, current_
         if not sid:
             return None
 
-        # --- Run backtest ---
         result = await mcp_call_tool_with_retry(
             session, "run_backtest",
             {"strategyId": sid, "symbol": td_symbol, "timeframe": TIMEFRAME}
@@ -281,7 +263,6 @@ async def optimize_instrument(session, oanda_name: str, td_symbol: str, current_
             print(f"   ⚠️ Backtest error: {text[:150]}")
             return None
 
-        # Log FULL raw response
         print(f"   Raw backtest response (full):\n{text}\n")
 
         sharpe = extract_sharpe(text)
@@ -363,18 +344,15 @@ async def main():
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            print("📡 Fetching Trader.dev instruments (this may take a few seconds)…")
-            td_symbols = await get_traderdev_symbols(session)
-            print(f"   Found {len(td_symbols)} symbols on Trader.dev.")
-            if td_symbols:
-                sample = sorted(list(td_symbols))[:20]
-                print(f"   Sample: {sample}")
-
+            # 1. Fetch OANDA instruments
             print("📡 Fetching OANDA instruments…")
             oanda_set = get_oanda_instruments()
             print(f"   Found {len(oanda_set)} instruments on OANDA.")
 
-            matched = match_instruments(oanda_set, td_symbols)
+            # 2. Dynamically match crypto pairs with Trader.dev
+            print("🔎 Matching OANDA crypto pairs to Trader.dev…")
+            matched = await match_oanda_crypto_to_traderdev(session, oanda_set)
+
             if not matched:
                 print("⚠️ No matches found, using hardcoded crypto fallback.")
                 matched = {
@@ -384,10 +362,12 @@ async def main():
                     "BCH_USD": "BCHUSDT",
                     "XRP_USD": "XRPUSDT"
                 }
+
             print(f"🔗 Matched {len(matched)} instruments:")
             for k, v in matched.items():
                 print(f"   {k} → {v}")
 
+            # 3. Optimize each matched instrument
             for oanda_name, td_symbol in matched.items():
                 current_best = best_strategies.get(oanda_name)
                 result = await optimize_instrument(session, oanda_name, td_symbol, current_best)
