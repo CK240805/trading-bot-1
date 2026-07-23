@@ -28,6 +28,8 @@ OANDA_ENV = os.environ.get("OANDA_ENV", "practice")
 TIMEFRAME = "1h"
 LLM_MAX_RETRIES = 5
 LLM_RETRY_DELAY = 10
+MCP_MAX_RETRIES = 3
+MCP_RETRY_DELAY = 5  # seconds base delay for MCP tool retries
 
 llm_client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY)
 oanda_api = API(access_token=OANDA_API_KEY, environment=OANDA_ENV) if OANDA_API_KEY else None
@@ -90,6 +92,22 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
                 break
     return ""
 
+# ---------- MCP tool call with retry ----------
+async def mcp_call_tool_with_retry(session, tool_name: str, arguments: dict, max_retries: int = MCP_MAX_RETRIES, delay: int = MCP_RETRY_DELAY) -> dict:
+    """Call an MCP tool with retry on transient errors."""
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            result = await session.call_tool(tool_name, arguments=arguments)
+            return result
+        except Exception as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                wait = delay * (attempt + 1)
+                print(f"   MCP tool '{tool_name}' failed (attempt {attempt+1}/{max_retries}): {e}. Retrying in {wait}s…")
+                await asyncio.sleep(wait)
+    raise last_exception
+
 # ---------- Fetch instruments ----------
 def get_oanda_instruments() -> set:
     """Return a set of OANDA instrument names (e.g., EUR_USD, BTC_USD)."""
@@ -109,22 +127,18 @@ async def get_traderdev_symbols(session) -> set:
     Fetch all available symbols from Trader.dev by probing common prefixes.
     Returns a set of symbol strings (e.g., 'BTCUSDT', 'ETHUSDT').
     """
-    # Common starting letters and prefixes for crypto perpetuals
     search_terms = [
-        # Single letters cover most symbols
         "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
         "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
-        # Popular coins explicitly
         "BTC", "ETH", "XRP", "LTC", "BCH", "ADA", "SOL", "DOGE", "AVAX",
         "DOT", "LINK", "UNI", "MATIC", "SHIB", "TRX", "ETC", "XLM", "ATOM"
     ]
     all_symbols = set()
     for term in search_terms:
         try:
-            result = await session.call_tool("search_perps", arguments={"query": term})
+            result = await mcp_call_tool_with_retry(session, "search_perps", {"query": term})
             if result.content and result.content[0].text:
                 text = result.content[0].text
-                # The response could be JSON list of objects or just strings
                 data = json.loads(text)
                 if isinstance(data, list):
                     for item in data:
@@ -134,23 +148,18 @@ async def get_traderdev_symbols(session) -> set:
                             all_symbols.add(item)
         except Exception as e:
             print(f"  (skipping term '{term}' due to error: {e})")
-        await asyncio.sleep(0.5)  # be gentle to the API
+        await asyncio.sleep(0.5)
     return all_symbols
 
 def match_instruments(oanda_set: set, traderdev_set: set) -> dict:
-    """
-    Cross‑match OANDA instruments with Trader.dev symbols.
-    Returns a dict mapping OANDA name → Trader.dev symbol.
-    """
+    """Cross‑match OANDA instruments with Trader.dev symbols."""
     matched = {}
     for oanda_name in oanda_set:
         if not oanda_name.endswith("_USD"):
             continue
-        # Try USDT first
         td_candidate = oanda_name.replace("_USD", "USDT")
         if td_candidate in traderdev_set:
             matched[oanda_name] = td_candidate
-        # Also try without T (e.g., BTCUSD)
         elif oanda_name.replace("_USD", "USD") in traderdev_set:
             matched[oanda_name] = oanda_name.replace("_USD", "USD")
     return matched
@@ -175,30 +184,42 @@ def clean_pine_code(code: str) -> str:
     code = re.sub(r'default_qty_value\s*=\s*\d+', 'default_qty_value=100', code)
     return code.strip()
 
-def extract_sharpe(obj, depth=0):
+def extract_sharpe(obj):
+    """
+    Extract Sharpe ratio from a string, dict, or list.
+    Searches for common key names: sharpe_ratio, sharpeRatio, sharpe.
+    """
+    # If it's a string, try JSON then regex
     if isinstance(obj, str):
         try:
             obj = json.loads(obj)
         except:
-            match = re.search(r'sharpe["\']?\s*[:=]\s*([0-9.]+)', obj, re.IGNORECASE)
-            if match:
-                return float(match.group(1))
+            # Broad regex for any "sharpe*" key followed by a number
+            matches = re.findall(r'"sharpe[^"]*"\s*:\s*([0-9.-]+)', obj, re.IGNORECASE)
+            if matches:
+                return float(matches[0])
             return None
-    if depth > 10 or obj is None:
+
+    # Recursive search in dict/list
+    def _search(o, depth=0):
+        if depth > 10 or o is None:
+            return None
+        if isinstance(o, dict):
+            for k, v in o.items():
+                # Case-insensitive partial match on key
+                if "sharpe" in k.lower() and isinstance(v, (int, float)):
+                    return float(v)
+                r = _search(v, depth + 1)
+                if r is not None:
+                    return r
+        elif isinstance(o, list):
+            for item in o:
+                r = _search(item, depth + 1)
+                if r is not None:
+                    return r
         return None
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if "sharpe" in k.lower() and isinstance(v, (int, float)):
-                return float(v)
-            r = extract_sharpe(v, depth + 1)
-            if r is not None:
-                return r
-    elif isinstance(obj, list):
-        for item in obj:
-            r = extract_sharpe(item, depth + 1)
-            if r is not None:
-                return r
-    return None
+
+    return _search(obj)
 
 # ---------- Backtest workflow ----------
 async def optimize_instrument(session, oanda_name: str, td_symbol: str, current_best: dict = None) -> dict:
@@ -227,9 +248,10 @@ async def optimize_instrument(session, oanda_name: str, td_symbol: str, current_
     name = f"github-{oanda_name}-{int(time.time())}"
 
     try:
-        result = await session.call_tool(
-            "create_strategy",
-            arguments={"name": name, "symbol": td_symbol, "timeframe": TIMEFRAME, "pineSource": pine_code}
+        # --- Create strategy ---
+        result = await mcp_call_tool_with_retry(
+            session, "create_strategy",
+            {"name": name, "symbol": td_symbol, "timeframe": TIMEFRAME, "pineSource": pine_code}
         )
         if not result.content:
             return None
@@ -247,9 +269,10 @@ async def optimize_instrument(session, oanda_name: str, td_symbol: str, current_
         if not sid:
             return None
 
-        result = await session.call_tool(
-            "run_backtest",
-            arguments={"strategyId": sid, "symbol": td_symbol, "timeframe": TIMEFRAME}
+        # --- Run backtest ---
+        result = await mcp_call_tool_with_retry(
+            session, "run_backtest",
+            {"strategyId": sid, "symbol": td_symbol, "timeframe": TIMEFRAME}
         )
         if not result.content:
             return None
@@ -258,10 +281,12 @@ async def optimize_instrument(session, oanda_name: str, td_symbol: str, current_
             print(f"   ⚠️ Backtest error: {text[:150]}")
             return None
 
-        print(f"   Raw backtest response: {text[:500]}")
+        # Log FULL raw response
+        print(f"   Raw backtest response (full):\n{text}\n")
+
         sharpe = extract_sharpe(text)
         if sharpe is None:
-            print("   ⚠️ Could not extract Sharpe.")
+            print("   ⚠️ Could not extract Sharpe (raw response printed above).")
             return None
 
         print(f"   Sharpe = {sharpe:.3f}")
@@ -342,7 +367,6 @@ async def main():
             td_symbols = await get_traderdev_symbols(session)
             print(f"   Found {len(td_symbols)} symbols on Trader.dev.")
             if td_symbols:
-                # Print a sample for verification
                 sample = sorted(list(td_symbols))[:20]
                 print(f"   Sample: {sample}")
 
