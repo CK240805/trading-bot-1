@@ -21,14 +21,6 @@ jobs:
         run: |
           pip install openai mcp oandapyV20 backtrader pandas requests
 
-      - name: Debug OANDA env
-        env:
-          OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
-          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-        run: |
-          echo "Account ID length: ${#OANDA_ACCOUNT_ID}"
-          echo "API Key length: ${#OANDA_API_KEY}"
-
       - name: Run OANDA optimization
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
