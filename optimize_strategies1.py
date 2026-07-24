@@ -1,10 +1,6 @@
 """
-OANDA Strategy Optimizer – DeepSeek decides everything.
-DeepSeek selects:
-  - Which 5 instruments to optimise today
-  - For each instrument: the strategy type (sma_cross / rsi_reversal / macd_cross)
-  - The strategy parameters as JSON
-Backtests via local OANDA MCP server and saves best per‑instrument strategy to Gist.
+OANDA Strategy Optimizer – DeepSeek decides instruments & strategy types.
+Ensures OANDA credentials are explicitly set in the environment before spawning the MCP server.
 """
 import os, json, time, asyncio, requests, re
 from collections import deque
@@ -17,6 +13,16 @@ NVIDIA_API_KEY = os.environ["NVIDIA_API_KEY"]
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-ai/deepseek-v4-flash")
 GITHUB_GIST_TOKEN = os.environ["GITHUB_GIST_TOKEN"]
 GIST_ID = os.environ.get("GIST_ID")
+
+# OANDA credentials (must be set in Actions secrets)
+OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID")
+OANDA_API_KEY = os.environ.get("OANDA_API_KEY")
+OANDA_ENV = os.environ.get("OANDA_ENV", "practice")
+
+# Make sure they're visible to the subprocess (already true in Actions)
+os.environ["OANDA_ACCOUNT_ID"] = OANDA_ACCOUNT_ID or ""
+os.environ["OANDA_API_KEY"] = OANDA_API_KEY or ""
+os.environ["OANDA_ENV"] = OANDA_ENV
 
 MAX_INSTRUMENTS_PER_RUN = int(os.environ.get("MAX_INSTRUMENTS_PER_RUN", "5"))
 LLM_MAX_RETRIES = 5
@@ -84,7 +90,6 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
 
 # ---------- AI helpers ----------
 def ai_pick_instruments() -> list:
-    """Ask DeepSeek which 5 OANDA instruments to optimise today."""
     system = (
         "You are a senior financial market analyst. "
         "Select the 5 most important OANDA instruments to optimise trading strategies for today. "
@@ -104,10 +109,6 @@ def ai_pick_instruments() -> list:
     return []
 
 def ai_propose_strategy(instrument: str) -> dict:
-    """
-    Ask DeepSeek to propose a strategy type and parameters for the given instrument.
-    Returns a dict with keys: 'type' (strategy_type), 'params' (parameter dict).
-    """
     system = (
         "You are an expert quantitative strategist. For the given OANDA instrument, "
         "choose the best strategy type among: sma_cross, rsi_reversal, macd_cross. "
@@ -199,7 +200,6 @@ async def main():
     except:
         best_strategies = {}
 
-    # AI picks instruments
     instruments = ai_pick_instruments()
     if not instruments:
         instruments = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
@@ -236,7 +236,6 @@ async def main():
                     }
                     print(f"   ✅ Improved! New best Sharpe: {sharpe:.3f}")
 
-                    # Save to Gist
                     write_gist(gist_id, {
                         "virtual_balance": state.get("virtual_balance", 100.0),
                         "trading_paused": state.get("trading_paused", False),
