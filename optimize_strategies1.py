@@ -1,8 +1,8 @@
 """
 OANDA Strategy Optimizer – DeepSeek decides instruments & strategy types.
-Ensures OANDA credentials are explicitly set in the environment before spawning the MCP server.
+Ensures OANDA credentials are passed to the MCP subprocess via its environment.
 """
-import os, json, time, asyncio, requests, re
+import os, json, time, asyncio, requests
 from collections import deque
 from openai import OpenAI
 from mcp import ClientSession, StdioServerParameters
@@ -14,19 +14,13 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-ai/deepseek-v4-flash")
 GITHUB_GIST_TOKEN = os.environ["GITHUB_GIST_TOKEN"]
 GIST_ID = os.environ.get("GIST_ID")
 
-# OANDA credentials (must be set in Actions secrets)
-OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID")
-OANDA_API_KEY = os.environ.get("OANDA_API_KEY")
+OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
+OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "")
 OANDA_ENV = os.environ.get("OANDA_ENV", "practice")
 
-# After loading OANDA_ACCOUNT_ID etc.
-print(f"🔑 OANDA_ACCOUNT_ID length: {len(OANDA_ACCOUNT_ID or '')}")
-print(f"🔑 OANDA_API_KEY length: {len(OANDA_API_KEY or '')}")
-
-# Make sure they're visible to the subprocess (already true in Actions)
-os.environ["OANDA_ACCOUNT_ID"] = OANDA_ACCOUNT_ID or ""
-os.environ["OANDA_API_KEY"] = OANDA_API_KEY or ""
-os.environ["OANDA_ENV"] = OANDA_ENV
+# Optional: print lengths to verify they are loaded
+print(f"🔑 OANDA_ACCOUNT_ID length: {len(OANDA_ACCOUNT_ID)}")
+print(f"🔑 OANDA_API_KEY length: {len(OANDA_API_KEY)}")
 
 MAX_INSTRUMENTS_PER_RUN = int(os.environ.get("MAX_INSTRUMENTS_PER_RUN", "5"))
 LLM_MAX_RETRIES = 5
@@ -140,7 +134,12 @@ def ai_propose_strategy(instrument: str) -> dict:
     return None
 
 # ---------- MCP client helpers ----------
-SERVER_PARAMS = StdioServerParameters(command="python", args=["oanda_mcp_server.py"])
+# *** FIX: pass the full current environment to the subprocess ***
+SERVER_PARAMS = StdioServerParameters(
+    command="python",
+    args=["oanda_mcp_server.py"],
+    env=os.environ.copy()          # <--- this is the critical line
+)
 
 async def backtest(session, instrument: str, strategy_type: str, params: dict) -> float:
     result = await session.call_tool("backtest_strategy", {
