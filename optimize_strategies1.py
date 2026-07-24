@@ -19,6 +19,10 @@ OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID")
 OANDA_API_KEY = os.environ.get("OANDA_API_KEY")
 OANDA_ENV = os.environ.get("OANDA_ENV", "practice")
 
+# After loading OANDA_ACCOUNT_ID etc.
+print(f"🔑 OANDA_ACCOUNT_ID length: {len(OANDA_ACCOUNT_ID or '')}")
+print(f"🔑 OANDA_API_KEY length: {len(OANDA_API_KEY or '')}")
+
 # Make sure they're visible to the subprocess (already true in Actions)
 os.environ["OANDA_ACCOUNT_ID"] = OANDA_ACCOUNT_ID or ""
 os.environ["OANDA_API_KEY"] = OANDA_API_KEY or ""
