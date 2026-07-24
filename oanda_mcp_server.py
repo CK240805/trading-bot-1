@@ -1,10 +1,6 @@
 """
-OANDA Backtesting MCP Server
-Supports multiple strategy types:
-  - sma_cross     (MA crossover)
-  - rsi_reversal  (RSI mean‑reversion)
-  - macd_cross    (MACD crossover)
-Uses OANDA v20 REST API + Backtrader.
+OANDA Backtesting MCP Server – Multi‑strategy support.
+Explicitly checks for API credentials and logs helpful messages on failure.
 """
 import asyncio, os, json, logging
 from mcp.server import Server
@@ -27,15 +23,31 @@ OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 OANDA_API_KEY = os.getenv("OANDA_API_KEY")
 OANDA_ENV = os.getenv("OANDA_ENV", "practice")
 
+# Verify credentials immediately
+if not OANDA_API_KEY:
+    logger.error("❌ OANDA_API_KEY is not set – candle requests will fail.")
+if not OANDA_ACCOUNT_ID:
+    logger.error("❌ OANDA_ACCOUNT_ID is not set – candle requests will fail.")
+else:
+    logger.info(f"✅ OANDA account ID: {OANDA_ACCOUNT_ID}")
+
 oanda = API(access_token=OANDA_API_KEY, environment=OANDA_ENV)
 
 app = Server("oanda-backtest")
 
 # ---------- OANDA candle fetching ----------
 def fetch_candles(instrument: str, granularity: str = "H1", count: int = 2000) -> pd.DataFrame:
+    """Try to fetch candles; return empty DataFrame on any error."""
+    if not OANDA_API_KEY:
+        logger.error("No OANDA API key – cannot fetch candles.")
+        return pd.DataFrame()
     params = {"granularity": granularity, "count": count, "price": "M"}
     r = instruments.InstrumentsCandles(instrument=instrument, params=params)
-    resp = oanda.request(r)
+    try:
+        resp = oanda.request(r)
+    except Exception as e:
+        logger.error(f"Candle fetch failed: {e}")
+        return pd.DataFrame()
     candles = resp.get("candles", [])
     rows = []
     for c in candles:
@@ -55,7 +67,7 @@ def fetch_candles(instrument: str, granularity: str = "H1", count: int = 2000) -
         df.set_index("datetime", inplace=True)
     return df
 
-# ---------- Strategy classes ----------
+# ---------- Strategy classes (unchanged) ----------
 class SMACross(bt.Strategy):
     params = dict(ma_fast=10, ma_slow=30)
     def __init__(self):
@@ -63,10 +75,8 @@ class SMACross(bt.Strategy):
         self.slow = bt.indicators.SMA(self.data.close, period=self.p.ma_slow)
         self.cross = bt.indicators.CrossOver(self.fast, self.slow)
     def next(self):
-        if self.cross > 0:
-            self.buy()
-        elif self.cross < 0:
-            self.sell()
+        if self.cross > 0: self.buy()
+        elif self.cross < 0: self.sell()
 
 class RSIMeanRev(bt.Strategy):
     params = dict(rsi_period=14, oversold=30, overbought=70)
@@ -87,10 +97,8 @@ class MACDCross(bt.Strategy):
                                        period_signal=self.p.signal)
         self.cross = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
     def next(self):
-        if self.cross > 0:
-            self.buy()
-        elif self.cross < 0:
-            self.sell()
+        if self.cross > 0: self.buy()
+        elif self.cross < 0: self.sell()
 
 STRATEGIES = {
     "sma_cross": SMACross,
@@ -98,7 +106,6 @@ STRATEGIES = {
     "macd_cross": MACDCross,
 }
 
-# ---------- Backtest runner ----------
 def run_backtest(df: pd.DataFrame, strategy_type: str, params: dict) -> dict:
     cerebro = bt.Cerebro()
     cerebro.adddata(bt.feeds.PandasData(dataname=df))
@@ -127,7 +134,7 @@ async def list_tools():
         ),
         Tool(
             name="backtest_strategy",
-            description="Backtest a trading strategy on OANDA historical data. Supports sma_cross, rsi_reversal, macd_cross.",
+            description="Backtest a trading strategy on OANDA historical data.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -157,14 +164,11 @@ async def call_tool(name: str, arguments: dict):
         granularity = arguments.get("granularity", "H1")
         strategy_type = arguments["strategy_type"]
         params = arguments["params"]
-        try:
-            df = fetch_candles(instrument, granularity)
-            if df.empty:
-                return [TextContent(type="text", text=json.dumps({"error": "No data"}))]
-            result = run_backtest(df, strategy_type, params)
-            return [TextContent(type="text", text=json.dumps(result))]
-        except Exception as e:
-            return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+        df = fetch_candles(instrument, granularity)
+        if df.empty:
+            return [TextContent(type="text", text=json.dumps({"error": "No data or authentication failed"}))]
+        result = run_backtest(df, strategy_type, params)
+        return [TextContent(type="text", text=json.dumps(result))]
 
     raise ValueError(f"Unknown tool: {name}")
 
