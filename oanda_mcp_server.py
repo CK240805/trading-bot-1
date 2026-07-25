@@ -2,6 +2,7 @@
 OANDA Universal Backtesting MCP Server
 Allows the AI to import only backtrader and math; otherwise sandboxed.
 Redirects stdout during backtest to prevent protocol corruption.
+Returns both Sharpe ratio and number of closed trades.
 """
 import asyncio, os, json, logging, sys, io
 from mcp.server import Server
@@ -109,28 +110,30 @@ def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
     cerebro.broker.setcash(10000.0)
     cerebro.broker.setcommission(commission=0.0001)
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=0.0, annualize=True)
+    cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
 
-    # Redirect stdout to a StringIO to catch prints from strategy/backtrader
     old_stdout = sys.stdout
     fake_stdout = io.StringIO()
     sys.stdout = fake_stdout
     try:
         results = cerebro.run()
     except Exception as e:
-        sys.stdout = old_stdout   # restore immediately
+        sys.stdout = old_stdout
         return {"error": f"Backtest runtime error: {e}"}
     finally:
-        sys.stdout = old_stdout   # always restore
-        captured = fake_stdout.getvalue()
-        if captured:
-            logger.debug(f"Captured stdout: {captured[:200]}")
+        sys.stdout = old_stdout
+        fake_stdout.getvalue()   # discard
 
     strat = results[0]
     analysis = strat.analyzers.sharpe.get_analysis()
     sharpe = analysis.get('sharperatio')
     if sharpe is None:
         sharpe = 0.0
-    return {"sharpe": round(float(sharpe), 4)}
+
+    trade_analysis = strat.analyzers.trades.get_analysis()
+    total_closed = trade_analysis.get('total', {}).get('closed', 0) if isinstance(trade_analysis, dict) else 0
+
+    return {"sharpe": round(float(sharpe), 4), "total_trades": total_closed}
 
 # ---------- MCP tools ----------
 @app.list_tools()
