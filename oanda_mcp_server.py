@@ -16,7 +16,7 @@ import backtrader as bt
 import pandas as pd
 import math
 
-logging.basicConfig(level=logging.INFO, stream=sys.stderr)   # ensure logs go to stderr
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("oanda-mcp")
 
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
@@ -110,18 +110,18 @@ def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
     cerebro.broker.setcommission(commission=0.0001)
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=0.0, annualize=True)
 
-    # Redirect stdout to a dummy to catch any print() calls from the strategy or backtrader
+    # Redirect stdout to a StringIO to catch prints from strategy/backtrader
     old_stdout = sys.stdout
-    sys.stdout = io.StringIO()
+    fake_stdout = io.StringIO()
+    sys.stdout = fake_stdout
     try:
         results = cerebro.run()
     except Exception as e:
-        sys.stdout = old_stdout
+        sys.stdout = old_stdout   # restore immediately
         return {"error": f"Backtest runtime error: {e}"}
     finally:
-        # Discard captured output
-        captured = sys.stdout.getvalue()
-        sys.stdout = old_stdout
+        sys.stdout = old_stdout   # always restore
+        captured = fake_stdout.getvalue()
         if captured:
             logger.debug(f"Captured stdout: {captured[:200]}")
 
