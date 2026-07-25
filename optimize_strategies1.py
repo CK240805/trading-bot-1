@@ -1,7 +1,7 @@
 """
 OANDA Strategy Optimizer – DeepSeek generates complete Python trading strategies.
-Unlimited strategy freedom – the AI writes the bt.Strategy subclass directly.
-With timeout, resilient MCP response handling, and feedback on trade count.
+The AI receives detailed performance feedback (Sharpe, return %, win rate, avg win/loss)
+and is instructed to improve based on those metrics.
 """
 import os, json, time, asyncio, requests
 from collections import deque
@@ -124,16 +124,19 @@ def ai_generate_strategy(instrument: str, current_best: dict = None) -> str:
         "            self.sell()\n"
     )
     if current_best:
-        prev_sharpe = current_best.get('sharpe', 'N/A')
-        prev_code = current_best.get('code', 'None')
-        if prev_sharpe == 0.0 or prev_sharpe == 0:
-            hint = "The previous strategy made NO trades (Sharpe 0). Please create a completely different, more aggressive strategy that definitely trades."
-        else:
-            hint = f"Previous Sharpe: {prev_sharpe}. Try to improve it."
+        prev = current_best
         prompt = (
-            f"Instrument: {instrument} H1\n{hint}\n"
-            f"Previous code:\n{prev_code}\n\n"
-            "Please write a new, improved Python trading strategy for backtrader that will generate at least 1 trade per week."
+            f"Instrument: {instrument} H1\n"
+            f"Previous strategy metrics:\n"
+            f"  Sharpe: {prev.get('sharpe', 'N/A')}\n"
+            f"  Total Return: {prev.get('total_return_pct', 'N/A')}%\n"
+            f"  Win Rate: {prev.get('win_rate', 'N/A')}%\n"
+            f"  Avg Win: {prev.get('avg_win', 'N/A')}\n"
+            f"  Avg Loss: {prev.get('avg_loss', 'N/A')}\n"
+            f"  Total Trades: {prev.get('total_trades', 'N/A')}\n"
+            f"Previous strategy code:\n{prev.get('code', 'None')}\n\n"
+            "Please propose a completely new strategy that will improve the total return and Sharpe ratio. "
+            "Make it more selective to increase win rate, or use different indicators."
         )
     else:
         prompt = f"Write a Python trading strategy for {instrument} H1 that will definitely make trades (at least 1 per week)."
@@ -147,7 +150,12 @@ SERVER_PARAMS = StdioServerParameters(
     env=os.environ.copy()
 )
 
-async def backtest(session, instrument: str, code: str) -> tuple:
+async def backtest(session, instrument: str, code: str) -> dict:
+    """Return a dict with all performance metrics, or all zeros on failure."""
+    default = {
+        "sharpe": 0.0, "total_trades": 0, "total_return_pct": 0.0,
+        "win_rate": 0.0, "avg_win": 0.0, "avg_loss": 0.0
+    }
     try:
         async with asyncio.timeout(30):
             result = await session.call_tool("backtest_python_strategy", {
@@ -156,26 +164,27 @@ async def backtest(session, instrument: str, code: str) -> tuple:
             })
     except asyncio.TimeoutError:
         print("   ⏰ MCP backtest call timed out (30s).")
-        return 0.0, 0
+        return default
 
     if result.content and len(result.content) > 0:
         text = result.content[0].text
         print(f"   Raw backtest response: {text[:500]}")
         if not text or not text.strip():
-            return 0.0, 0
+            return default
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
             print("   ⚠️ Invalid JSON in backtest response.")
-            return 0.0, 0
+            return default
         if "error" in data:
             print(f"   Backtest error: {data['error']}")
-            return 0.0, 0
-        sharpe = data.get("sharpe", 0.0)
-        trades = data.get("total_trades", 0)
-        print(f"   Trades made: {trades}")
-        return sharpe, trades
-    return 0.0, 0
+            return default
+        # Merge with defaults to fill any missing keys
+        for k in default:
+            if k not in data:
+                data[k] = default[k]
+        return data
+    return default
 
 # ---------- Gist helpers ----------
 GIST_HEADERS = {
@@ -218,11 +227,12 @@ async def main():
         })
         print(f"✅ Created gist: {gist_id}")
 
+    state = {"virtual_balance": 100.0, "trading_paused": False, "best_strategies": {}}
     try:
         state = read_gist(gist_id)
-        best_strategies = state.get("best_strategies", {})
-    except:
-        best_strategies = {}
+    except Exception as e:
+        print(f"⚠️ Could not read Gist ({e}). Using empty state.")
+    best_strategies = state.get("best_strategies", {})
 
     instruments = ai_pick_instruments()
     if not instruments:
@@ -250,14 +260,17 @@ async def main():
 
                 print(f"   Generated strategy (first 200 chars): {code[:200]}")
 
-                sharpe, trades = await backtest(session, instrument, code)
-                print(f"   Sharpe = {sharpe:.3f}")
+                result = await backtest(session, instrument, code)
+                sharpe = result["sharpe"]
+                trades = result["total_trades"]
+                print(f"   Sharpe = {sharpe:.3f}, Trades = {trades}, "
+                      f"Return = {result['total_return_pct']:.2f}%, Win Rate = {result['win_rate']:.1f}%")
 
                 if sharpe > current_sharpe:
+                    # Save everything we got back + the code
                     best_strategies[instrument] = {
                         "code": code,
-                        "sharpe": sharpe,
-                        "trades": trades,
+                        **result,
                         "optimized_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")
                     }
                     print(f"   ✅ Improved! New best Sharpe: {sharpe:.3f}")
