@@ -1,8 +1,9 @@
 """
-OANDA Backtesting MCP Server – Multi‑strategy support.
-Explicitly checks for API credentials and logs helpful messages on failure.
+OANDA Universal Backtesting MCP Server
+Accepts arbitrary Python strategy code (a bt.Strategy subclass) from the LLM,
+backtests it on OANDA data, and returns the Sharpe ratio.
 """
-import asyncio, os, json, logging
+import asyncio, os, json, logging, sys, io
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 from mcp.server.stdio import stdio_server
@@ -23,13 +24,10 @@ OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 OANDA_API_KEY = os.getenv("OANDA_API_KEY")
 OANDA_ENV = os.getenv("OANDA_ENV", "practice")
 
-# Verify credentials immediately
-if not OANDA_API_KEY:
-    logger.error("❌ OANDA_API_KEY is not set – candle requests will fail.")
-if not OANDA_ACCOUNT_ID:
-    logger.error("❌ OANDA_ACCOUNT_ID is not set – candle requests will fail.")
+if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
+    logger.error("❌ OANDA credentials missing")
 else:
-    logger.info(f"✅ OANDA account ID: {OANDA_ACCOUNT_ID}")
+    logger.info("✅ OANDA credentials present")
 
 oanda = API(access_token=OANDA_API_KEY, environment=OANDA_ENV)
 
@@ -37,10 +35,6 @@ app = Server("oanda-backtest")
 
 # ---------- OANDA candle fetching ----------
 def fetch_candles(instrument: str, granularity: str = "H1", count: int = 2000) -> pd.DataFrame:
-    """Try to fetch candles; return empty DataFrame on any error."""
-    if not OANDA_API_KEY:
-        logger.error("No OANDA API key – cannot fetch candles.")
-        return pd.DataFrame()
     params = {"granularity": granularity, "count": count, "price": "M"}
     r = instruments.InstrumentsCandles(instrument=instrument, params=params)
     try:
@@ -67,61 +61,41 @@ def fetch_candles(instrument: str, granularity: str = "H1", count: int = 2000) -
         df.set_index("datetime", inplace=True)
     return df
 
-# ---------- Strategy classes (unchanged) ----------
-class SMACross(bt.Strategy):
-    params = dict(ma_fast=10, ma_slow=30)
-    def __init__(self):
-        self.fast = bt.indicators.SMA(self.data.close, period=self.p.ma_fast)
-        self.slow = bt.indicators.SMA(self.data.close, period=self.p.ma_slow)
-        self.cross = bt.indicators.CrossOver(self.fast, self.slow)
-    def next(self):
-        if self.cross > 0: self.buy()
-        elif self.cross < 0: self.sell()
+# ---------- Safe code execution ----------
+def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
+    """
+    Execute the provided Python code which must define a class named 'UserStrategy'
+    that is a subclass of bt.Strategy. Backtest it and return the Sharpe ratio.
+    """
+    local_namespace = {}
+    try:
+        # Compile and exec the code in a restricted namespace
+        exec(code, {"bt": bt, "__builtins__": {}}, local_namespace)
+    except Exception as e:
+        return {"error": f"Strategy code compilation failed: {e}"}
 
-class RSIMeanRev(bt.Strategy):
-    params = dict(rsi_period=14, oversold=30, overbought=70)
-    def __init__(self):
-        self.rsi = bt.indicators.RSI(self.data.close, period=self.p.rsi_period)
-    def next(self):
-        if self.rsi < self.p.oversold and not self.position:
-            self.buy()
-        elif self.rsi > self.p.overbought and self.position:
-            self.close()
+    UserStrategy = local_namespace.get("UserStrategy")
+    if not UserStrategy or not issubclass(UserStrategy, bt.Strategy):
+        return {"error": "Code must define a 'UserStrategy' subclass of bt.Strategy"}
 
-class MACDCross(bt.Strategy):
-    params = dict(fast=12, slow=26, signal=9)
-    def __init__(self):
-        self.macd = bt.indicators.MACD(self.data.close,
-                                       period_me1=self.p.fast,
-                                       period_me2=self.p.slow,
-                                       period_signal=self.p.signal)
-        self.cross = bt.indicators.CrossOver(self.macd.macd, self.macd.signal)
-    def next(self):
-        if self.cross > 0: self.buy()
-        elif self.cross < 0: self.sell()
-
-STRATEGIES = {
-    "sma_cross": SMACross,
-    "rsi_reversal": RSIMeanRev,
-    "macd_cross": MACDCross,
-}
-
-def run_backtest(df: pd.DataFrame, strategy_type: str, params: dict) -> dict:
     cerebro = bt.Cerebro()
     cerebro.adddata(bt.feeds.PandasData(dataname=df))
-    strat_cls = STRATEGIES.get(strategy_type)
-    if strat_cls is None:
-        return {"error": f"Unknown strategy type: {strategy_type}"}
-    cerebro.addstrategy(strat_cls, **params)
+    cerebro.addstrategy(UserStrategy)
     cerebro.broker.setcash(10000.0)
     cerebro.broker.setcommission(commission=0.0001)
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=0.0, annualize=True)
-    results = cerebro.run()
+
+    try:
+        results = cerebro.run()
+    except Exception as e:
+        return {"error": f"Backtest runtime error: {e}"}
+
     strat = results[0]
-    sharpe = strat.analyzers.sharpe.get_analysis().get('sharperatio', 0.0)
+    analysis = strat.analyzers.sharpe.get_analysis()
+    sharpe = analysis.get('sharperatio')
     if sharpe is None:
         sharpe = 0.0
-    return {"sharpe": round(sharpe, 4)}
+    return {"sharpe": round(float(sharpe), 4)}
 
 # ---------- MCP tools ----------
 @app.list_tools()
@@ -133,17 +107,16 @@ async def list_tools():
             inputSchema={"type": "object", "properties": {}}
         ),
         Tool(
-            name="backtest_strategy",
-            description="Backtest a trading strategy on OANDA historical data.",
+            name="backtest_python_strategy",
+            description="Backtest a user-provided Python strategy (bt.Strategy subclass) on OANDA data and return the Sharpe ratio.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "instrument": {"type": "string"},
+                    "instrument": {"type": "string", "description": "e.g. EUR_USD"},
                     "granularity": {"type": "string", "default": "H1"},
-                    "strategy_type": {"type": "string", "enum": ["sma_cross", "rsi_reversal", "macd_cross"]},
-                    "params": {"type": "object"}
+                    "code": {"type": "string", "description": "Full Python code defining a 'UserStrategy' class inheriting from bt.Strategy"}
                 },
-                "required": ["instrument", "strategy_type", "params"]
+                "required": ["instrument", "code"]
             }
         )
     ]
@@ -159,15 +132,16 @@ async def call_tool(name: str, arguments: dict):
         except Exception as e:
             return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
 
-    elif name == "backtest_strategy":
+    elif name == "backtest_python_strategy":
         instrument = arguments["instrument"]
         granularity = arguments.get("granularity", "H1")
-        strategy_type = arguments["strategy_type"]
-        params = arguments["params"]
+        code = arguments["code"]
+
         df = fetch_candles(instrument, granularity)
         if df.empty:
-            return [TextContent(type="text", text=json.dumps({"error": "No data or authentication failed"}))]
-        result = run_backtest(df, strategy_type, params)
+            return [TextContent(type="text", text=json.dumps({"error": "No OANDA data (check instrument name or API key)"}))]
+
+        result = run_user_strategy(df, code)
         return [TextContent(type="text", text=json.dumps(result))]
 
     raise ValueError(f"Unknown tool: {name}")
