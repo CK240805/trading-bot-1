@@ -2,7 +2,7 @@
 OANDA Universal Backtesting MCP Server
 Allows the AI to import only backtrader and math; otherwise sandboxed.
 Redirects stdout during backtest to prevent protocol corruption.
-Returns both Sharpe ratio and number of closed trades.
+Returns Sharpe ratio, total trades, total return %, win rate, avg win/loss.
 """
 import asyncio, os, json, logging, sys, io
 from mcp.server import Server
@@ -107,8 +107,11 @@ def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
     cerebro = bt.Cerebro()
     cerebro.adddata(bt.feeds.PandasData(dataname=df))
     cerebro.addstrategy(UserStrategy)
-    cerebro.broker.setcash(10000.0)
+    start_cash = 10000.0
+    cerebro.broker.setcash(start_cash)
     cerebro.broker.setcommission(commission=0.0001)
+
+    # Analyzers
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=0.0, annualize=True)
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
 
@@ -125,15 +128,42 @@ def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
         fake_stdout.getvalue()   # discard
 
     strat = results[0]
-    analysis = strat.analyzers.sharpe.get_analysis()
-    sharpe = analysis.get('sharperatio')
+    end_value = cerebro.broker.getvalue()
+
+    # Sharpe
+    sharpe_analysis = strat.analyzers.sharpe.get_analysis()
+    sharpe = sharpe_analysis.get('sharperatio')
     if sharpe is None:
         sharpe = 0.0
 
+    # Total return percentage
+    total_return_pct = round(((end_value - start_cash) / start_cash) * 100, 2)
+
+    # Trade analysis
     trade_analysis = strat.analyzers.trades.get_analysis()
     total_closed = trade_analysis.get('total', {}).get('closed', 0) if isinstance(trade_analysis, dict) else 0
 
-    return {"sharpe": round(float(sharpe), 4), "total_trades": total_closed}
+    won = trade_analysis.get('won', {}) if isinstance(trade_analysis, dict) else {}
+    lost = trade_analysis.get('lost', {}) if isinstance(trade_analysis, dict) else {}
+    won_total = won.get('total', 0) if isinstance(won, dict) else 0
+    lost_total = lost.get('total', 0) if isinstance(lost, dict) else 0
+    avg_win = won.get('average', 0) if isinstance(won, dict) else 0
+    avg_loss = lost.get('average', 0) if isinstance(lost, dict) else 0
+
+    # Win rate
+    if total_closed > 0:
+        win_rate = round((won_total / total_closed) * 100, 1)
+    else:
+        win_rate = 0.0
+
+    return {
+        "sharpe": round(float(sharpe), 4),
+        "total_trades": total_closed,
+        "total_return_pct": total_return_pct,
+        "win_rate": win_rate,
+        "avg_win": round(avg_win, 4),
+        "avg_loss": round(avg_loss, 4)
+    }
 
 # ---------- MCP tools ----------
 @app.list_tools()
@@ -146,7 +176,7 @@ async def list_tools():
         ),
         Tool(
             name="backtest_python_strategy",
-            description="Backtest a user-provided Python strategy (bt.Strategy subclass) on OANDA data and return the Sharpe ratio.",
+            description="Backtest a user-provided Python strategy (bt.Strategy subclass) on OANDA data and return performance metrics.",
             inputSchema={
                 "type": "object",
                 "properties": {
