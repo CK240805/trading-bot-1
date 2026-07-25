@@ -1,6 +1,7 @@
 """
 OANDA Universal Backtesting MCP Server
-Allows the AI to import only backtrader; otherwise sandboxed.
+Allows the AI to import only backtrader and math; otherwise sandboxed.
+Provides missing builtins like __name__ for class definitions.
 """
 import asyncio, os, json, logging, sys, io
 from mcp.server import Server
@@ -13,6 +14,7 @@ import oandapyV20.endpoints.accounts as accounts
 
 import backtrader as bt
 import pandas as pd
+import math
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("oanda-mcp")
@@ -31,19 +33,23 @@ oanda = API(access_token=OANDA_API_KEY, environment=OANDA_ENV)
 app = Server("oanda-backtest")
 
 # ---------- Restricted import function ----------
-ALLOWED_MODULES = {"backtrader", "bt"}   # only these modules can be imported
+ALLOWED_MODULES = {"backtrader", "bt", "math"}   # only these modules can be imported
 
 def safe_import(name, *args, **kwargs):
-    """Allow importing only backtrader; block everything else."""
+    """Allow importing only allowed modules; block everything else."""
     base = name.split('.')[0]
     if base in ALLOWED_MODULES:
         return __import__(name, *args, **kwargs)
     raise ImportError(f"Import of '{name}' is not allowed")
 
-# Minimal builtins: only what's needed for class definitions and arithmetic
+# Minimal safe builtins – now includes class‑definition names
 SAFE_BUILTINS = {
     "__import__": safe_import,
-    "__build_class__": __build_class__,   # required for 'class' statement
+    "__build_class__": __build_class__,
+    "__name__": "__backtest__",
+    "__doc__": "",
+    "__module__": "__backtest__",
+    "__qualname__": "UserStrategy",
     "True": True, "False": False, "None": None,
     "abs": abs, "all": all, "any": any, "bin": bin, "bool": bool,
     "bytes": bytes, "callable": callable, "chr": chr, "complex": complex,
@@ -91,7 +97,7 @@ def fetch_candles(instrument: str, granularity: str = "H1", count: int = 2000) -
 def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
     local_namespace = {}
     try:
-        exec(code, {"bt": bt, "__builtins__": SAFE_BUILTINS}, local_namespace)
+        exec(code, {"bt": bt, "math": math, "__builtins__": SAFE_BUILTINS}, local_namespace)
     except Exception as e:
         return {"error": f"Strategy code compilation failed: {e}"}
 
