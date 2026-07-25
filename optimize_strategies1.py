@@ -1,6 +1,6 @@
 """
-OANDA Strategy Optimizer – DeepSeek decides instruments & strategy types.
-Ensures OANDA credentials are passed to the MCP subprocess via its environment.
+OANDA Strategy Optimizer – DeepSeek generates complete Python trading strategies.
+Unlimited strategy freedom – the AI writes the bt.Strategy subclass directly.
 """
 import os, json, time, asyncio, requests
 from collections import deque
@@ -17,10 +17,6 @@ GIST_ID = os.environ.get("GIST_ID")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
 OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "")
 OANDA_ENV = os.environ.get("OANDA_ENV", "practice")
-
-# Optional: print lengths to verify they are loaded
-print(f"🔑 OANDA_ACCOUNT_ID length: {len(OANDA_ACCOUNT_ID)}")
-print(f"🔑 OANDA_API_KEY length: {len(OANDA_API_KEY)}")
 
 MAX_INSTRUMENTS_PER_RUN = int(os.environ.get("MAX_INSTRUMENTS_PER_RUN", "5"))
 LLM_MAX_RETRIES = 5
@@ -106,49 +102,57 @@ def ai_pick_instruments() -> list:
         pass
     return []
 
-def ai_propose_strategy(instrument: str) -> dict:
+def ai_generate_strategy(instrument: str, current_best: dict = None) -> str:
+    """
+    Ask DeepSeek to write a complete Python bt.Strategy subclass for the instrument.
+    Returns the raw Python code as a string.
+    """
     system = (
-        "You are an expert quantitative strategist. For the given OANDA instrument, "
-        "choose the best strategy type among: sma_cross, rsi_reversal, macd_cross. "
-        "Then provide appropriate parameters. "
-        "Return ONLY a JSON object with exactly two keys: "
-        '"type": one of the three strategy types, '
-        '"params": a JSON object with the required parameters for that strategy.\n\n'
-        "Examples:\n"
-        '  sma_cross: {"type":"sma_cross","params":{"ma_fast":10,"ma_slow":30}}\n'
-        '  rsi_reversal: {"type":"rsi_reversal","params":{"rsi_period":14,"oversold":30,"overbought":70}}\n'
-        '  macd_cross: {"type":"macd_cross","params":{"fast":12,"slow":26,"signal":9}}'
+        "You are an expert algorithmic trader. Write a COMPLETE Python class named 'UserStrategy' "
+        "that inherits from backtrader.Strategy. The class must have at least an __init__ method "
+        "and a next() method. You can use any standard backtrader indicators (bt.indicators). "
+        "Include stop-loss, take-profit, or any risk management you want. "
+        "Return ONLY the Python code, no markdown, no explanations.\n\n"
+        "Example:\n"
+        "class UserStrategy(bt.Strategy):\n"
+        "    def __init__(self):\n"
+        "        self.sma_fast = bt.indicators.SMA(self.data.close, period=10)\n"
+        "        self.sma_slow = bt.indicators.SMA(self.data.close, period=30)\n"
+        "        self.crossover = bt.indicators.CrossOver(self.sma_fast, self.sma_slow)\n\n"
+        "    def next(self):\n"
+        "        if self.crossover > 0:\n"
+        "            self.buy()\n"
+        "        elif self.crossover < 0:\n"
+        "            self.sell()\n"
     )
-    prompt = f"Instrument: {instrument}\nTimeframe: H1"
-    response = deepseek_chat(prompt, system)
-    if not response:
-        return None
-    try:
-        if "```" in response:
-            response = response.split("```")[1].replace("json", "").strip()
-        proposal = json.loads(response)
-        if "type" in proposal and "params" in proposal:
-            return proposal
-    except:
-        pass
-    return None
+    if current_best:
+        prompt = (
+            f"Write a new, improved Python trading strategy for {instrument} H1. "
+            f"Current best strategy (Sharpe {current_best.get('sharpe', 'N/A')}):\n"
+            f"{current_best.get('code', 'None')}\n\n"
+            "Please propose a different approach that might yield a higher Sharpe."
+        )
+    else:
+        prompt = f"Write a Python trading strategy for {instrument} H1."
+
+    return deepseek_chat(prompt, system)
 
 # ---------- MCP client helpers ----------
-# *** FIX: pass the full current environment to the subprocess ***
 SERVER_PARAMS = StdioServerParameters(
     command="python",
     args=["oanda_mcp_server.py"],
-    env=os.environ.copy()          # <--- this is the critical line
+    env=os.environ.copy()
 )
 
-async def backtest(session, instrument: str, strategy_type: str, params: dict) -> float:
-    result = await session.call_tool("backtest_strategy", {
+async def backtest(session, instrument: str, code: str) -> float:
+    result = await session.call_tool("backtest_python_strategy", {
         "instrument": instrument,
-        "strategy_type": strategy_type,
-        "params": params
+        "code": code
     })
     if result.content:
-        data = json.loads(result.content[0].text)
+        text = result.content[0].text
+        print(f"   Raw backtest response: {text[:500]}")
+        data = json.loads(text)
         if "error" in data:
             print(f"   Backtest error: {data['error']}")
             return 0.0
@@ -184,7 +188,7 @@ def create_gist(data: dict) -> str:
 
 # ---------- Main ----------
 async def main():
-    print("🚀 Starting AI‑driven OANDA strategy optimization…")
+    print("🚀 Starting AI‑driven universal strategy optimization…")
 
     gist_id = GIST_ID
     if not gist_id:
@@ -195,7 +199,6 @@ async def main():
             "best_strategies": {}
         })
         print(f"✅ Created gist: {gist_id}")
-        print(f"👉 Add this to your GitHub Actions secrets: GIST_ID = {gist_id}")
 
     try:
         state = read_gist(gist_id)
@@ -214,26 +217,28 @@ async def main():
             await session.initialize()
 
             for instrument in instruments[:MAX_INSTRUMENTS_PER_RUN]:
-                current_best = best_strategies.get(instrument, {})
-                current_sharpe = current_best.get("sharpe", -9999)
+                current_best = best_strategies.get(instrument)
+                current_sharpe = current_best.get("sharpe", -9999) if current_best else -9999
                 print(f"\n📊 Optimizing {instrument} (best Sharpe: {current_sharpe:.3f})…")
 
-                proposal = ai_propose_strategy(instrument)
-                if not proposal:
-                    print("   ❌ Could not get strategy proposal.")
+                code = ai_generate_strategy(instrument, current_best)
+                if not code:
+                    print("   ❌ Could not get strategy code.")
                     continue
+                # Clean up markdown fences if any
+                if "```" in code:
+                    code = code.split("```")[1]
+                    if code.startswith("python"):
+                        code = code[6:].strip()
 
-                strategy_type = proposal["type"]
-                params = proposal["params"]
-                print(f"   Strategy: {strategy_type} with params {params}")
+                print(f"   Generated strategy (first 200 chars): {code[:200]}")
 
-                sharpe = await backtest(session, instrument, strategy_type, params)
+                sharpe = await backtest(session, instrument, code)
                 print(f"   Sharpe = {sharpe:.3f}")
 
                 if sharpe > current_sharpe:
                     best_strategies[instrument] = {
-                        "type": strategy_type,
-                        "params": params,
+                        "code": code,
                         "sharpe": sharpe,
                         "optimized_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")
                     }
