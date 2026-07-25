@@ -1,19 +1,16 @@
 """
 OANDA Universal Backtesting MCP Server
-Accepts arbitrary Python strategy code (a bt.Strategy subclass) from the LLM,
-backtests it on OANDA data, and returns the Sharpe ratio.
+Allows the AI to import only backtrader; otherwise sandboxed.
 """
 import asyncio, os, json, logging, sys, io
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 from mcp.server.stdio import stdio_server
 
-# OANDA
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
 import oandapyV20.endpoints.accounts as accounts
 
-# Backtrader
 import backtrader as bt
 import pandas as pd
 
@@ -32,6 +29,35 @@ else:
 oanda = API(access_token=OANDA_API_KEY, environment=OANDA_ENV)
 
 app = Server("oanda-backtest")
+
+# ---------- Restricted import function ----------
+ALLOWED_MODULES = {"backtrader", "bt"}   # only these modules can be imported
+
+def safe_import(name, *args, **kwargs):
+    """Allow importing only backtrader; block everything else."""
+    base = name.split('.')[0]
+    if base in ALLOWED_MODULES:
+        return __import__(name, *args, **kwargs)
+    raise ImportError(f"Import of '{name}' is not allowed")
+
+# Minimal builtins: only what's needed for class definitions and arithmetic
+SAFE_BUILTINS = {
+    "__import__": safe_import,
+    "__build_class__": __build_class__,   # required for 'class' statement
+    "True": True, "False": False, "None": None,
+    "abs": abs, "all": all, "any": any, "bin": bin, "bool": bool,
+    "bytes": bytes, "callable": callable, "chr": chr, "complex": complex,
+    "divmod": divmod, "enumerate": enumerate, "filter": filter, "float": float,
+    "format": format, "frozenset": frozenset, "getattr": getattr,
+    "globals": lambda: {}, "hasattr": hasattr, "hash": hash, "hex": hex,
+    "id": id, "int": int, "isinstance": isinstance, "issubclass": issubclass,
+    "iter": iter, "len": len, "list": list, "locals": lambda: {},
+    "map": map, "max": max, "min": min, "next": next, "object": object,
+    "oct": oct, "ord": ord, "pow": pow, "print": print, "range": range,
+    "repr": repr, "reversed": reversed, "round": round, "set": set,
+    "slice": slice, "sorted": sorted, "str": str, "sum": sum, "tuple": tuple,
+    "type": type, "vars": vars, "zip": zip,
+}
 
 # ---------- OANDA candle fetching ----------
 def fetch_candles(instrument: str, granularity: str = "H1", count: int = 2000) -> pd.DataFrame:
@@ -63,14 +89,9 @@ def fetch_candles(instrument: str, granularity: str = "H1", count: int = 2000) -
 
 # ---------- Safe code execution ----------
 def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
-    """
-    Execute the provided Python code which must define a class named 'UserStrategy'
-    that is a subclass of bt.Strategy. Backtest it and return the Sharpe ratio.
-    """
     local_namespace = {}
     try:
-        # Compile and exec the code in a restricted namespace
-        exec(code, {"bt": bt, "__builtins__": {}}, local_namespace)
+        exec(code, {"bt": bt, "__builtins__": SAFE_BUILTINS}, local_namespace)
     except Exception as e:
         return {"error": f"Strategy code compilation failed: {e}"}
 
