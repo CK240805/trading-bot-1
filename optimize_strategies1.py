@@ -1,9 +1,9 @@
 """
 OANDA Strategy Optimizer – DeepSeek generates complete Python trading strategies.
 Unlimited strategy freedom – the AI writes the bt.Strategy subclass directly.
-With timeout and resilient MCP response handling.
+With timeout, resilient MCP response handling, and feedback on trade count.
 """
-import os, json, time, asyncio, requests, signal
+import os, json, time, asyncio, requests
 from collections import deque
 from openai import OpenAI
 from mcp import ClientSession, StdioServerParameters
@@ -108,9 +108,10 @@ def ai_generate_strategy(instrument: str, current_best: dict = None) -> str:
         "You are an expert algorithmic trader. Write a COMPLETE Python class named 'UserStrategy' "
         "that inherits from backtrader.Strategy. The class must have at least an __init__ method "
         "and a next() method. You can use any standard backtrader indicators (bt.indicators). "
+        "CRITICAL: The strategy must generate at least 1 trade every 7 days on average. "
         "Include stop-loss, take-profit, or any risk management you want. "
         "Return ONLY the Python code, no markdown, no explanations.\n\n"
-        "Example:\n"
+        "Example of a working strategy:\n"
         "class UserStrategy(bt.Strategy):\n"
         "    def __init__(self):\n"
         "        self.sma_fast = bt.indicators.SMA(self.data.close, period=10)\n"
@@ -123,25 +124,30 @@ def ai_generate_strategy(instrument: str, current_best: dict = None) -> str:
         "            self.sell()\n"
     )
     if current_best:
+        prev_sharpe = current_best.get('sharpe', 'N/A')
+        prev_code = current_best.get('code', 'None')
+        if prev_sharpe == 0.0 or prev_sharpe == 0:
+            hint = "The previous strategy made NO trades (Sharpe 0). Please create a completely different, more aggressive strategy that definitely trades."
+        else:
+            hint = f"Previous Sharpe: {prev_sharpe}. Try to improve it."
         prompt = (
-            f"Write a new, improved Python trading strategy for {instrument} H1. "
-            f"Current best strategy (Sharpe {current_best.get('sharpe', 'N/A')}):\n"
-            f"{current_best.get('code', 'None')}\n\n"
-            "Please propose a different approach that might yield a higher Sharpe."
+            f"Instrument: {instrument} H1\n{hint}\n"
+            f"Previous code:\n{prev_code}\n\n"
+            "Please write a new, improved Python trading strategy for backtrader that will generate at least 1 trade per week."
         )
     else:
-        prompt = f"Write a Python trading strategy for {instrument} H1."
+        prompt = f"Write a Python trading strategy for {instrument} H1 that will definitely make trades (at least 1 per week)."
 
     return deepseek_chat(prompt, system)
 
-# ---------- MCP client helpers with timeout ----------
+# ---------- MCP client helpers ----------
 SERVER_PARAMS = StdioServerParameters(
     command="python",
     args=["oanda_mcp_server.py"],
     env=os.environ.copy()
 )
 
-async def backtest(session, instrument: str, code: str) -> float:
+async def backtest(session, instrument: str, code: str) -> tuple:
     try:
         async with asyncio.timeout(30):
             result = await session.call_tool("backtest_python_strategy", {
@@ -150,25 +156,26 @@ async def backtest(session, instrument: str, code: str) -> float:
             })
     except asyncio.TimeoutError:
         print("   ⏰ MCP backtest call timed out (30s).")
-        return 0.0
+        return 0.0, 0
 
     if result.content and len(result.content) > 0:
         text = result.content[0].text
         print(f"   Raw backtest response: {text[:500]}")
         if not text or not text.strip():
-            print("   ⚠️ Empty response from MCP server.")
-            return 0.0
+            return 0.0, 0
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
             print("   ⚠️ Invalid JSON in backtest response.")
-            return 0.0
+            return 0.0, 0
         if "error" in data:
             print(f"   Backtest error: {data['error']}")
-            return 0.0
-        return data.get("sharpe", 0.0)
-    print("   ⚠️ No content in backtest response.")
-    return 0.0
+            return 0.0, 0
+        sharpe = data.get("sharpe", 0.0)
+        trades = data.get("total_trades", 0)
+        print(f"   Trades made: {trades}")
+        return sharpe, trades
+    return 0.0, 0
 
 # ---------- Gist helpers ----------
 GIST_HEADERS = {
@@ -243,13 +250,14 @@ async def main():
 
                 print(f"   Generated strategy (first 200 chars): {code[:200]}")
 
-                sharpe = await backtest(session, instrument, code)
+                sharpe, trades = await backtest(session, instrument, code)
                 print(f"   Sharpe = {sharpe:.3f}")
 
                 if sharpe > current_sharpe:
                     best_strategies[instrument] = {
                         "code": code,
                         "sharpe": sharpe,
+                        "trades": trades,
                         "optimized_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")
                     }
                     print(f"   ✅ Improved! New best Sharpe: {sharpe:.3f}")
