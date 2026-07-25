@@ -1,7 +1,7 @@
 """
 OANDA Universal Backtesting MCP Server
 Allows the AI to import only backtrader and math; otherwise sandboxed.
-Provides missing builtins like __name__ for class definitions.
+Fixed sandbox: __name__ and __module__ set to safe defaults.
 """
 import asyncio, os, json, logging, sys, io
 from mcp.server import Server
@@ -33,22 +33,21 @@ oanda = API(access_token=OANDA_API_KEY, environment=OANDA_ENV)
 app = Server("oanda-backtest")
 
 # ---------- Restricted import function ----------
-ALLOWED_MODULES = {"backtrader", "bt", "math"}   # only these modules can be imported
+ALLOWED_MODULES = {"backtrader", "bt", "math"}
 
 def safe_import(name, *args, **kwargs):
-    """Allow importing only allowed modules; block everything else."""
     base = name.split('.')[0]
     if base in ALLOWED_MODULES:
         return __import__(name, *args, **kwargs)
     raise ImportError(f"Import of '{name}' is not allowed")
 
-# Minimal safe builtins – now includes class‑definition names
+# Minimal safe builtins – class‑definition names now use normal Python values
 SAFE_BUILTINS = {
     "__import__": safe_import,
     "__build_class__": __build_class__,
-    "__name__": "__backtest__",
+    "__name__": "__main__",            # <-- normal module name
     "__doc__": "",
-    "__module__": "__backtest__",
+    "__module__": "__main__",          # <-- normal module name
     "__qualname__": "UserStrategy",
     "True": True, "False": False, "None": None,
     "abs": abs, "all": all, "any": any, "bin": bin, "bool": bool,
