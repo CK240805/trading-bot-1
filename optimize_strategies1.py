@@ -1,8 +1,9 @@
 """
 OANDA Strategy Optimizer – DeepSeek generates complete Python trading strategies.
 Unlimited strategy freedom – the AI writes the bt.Strategy subclass directly.
+With timeout and resilient MCP response handling.
 """
-import os, json, time, asyncio, requests
+import os, json, time, asyncio, requests, signal
 from collections import deque
 from openai import OpenAI
 from mcp import ClientSession, StdioServerParameters
@@ -18,9 +19,10 @@ OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
 OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "")
 OANDA_ENV = os.environ.get("OANDA_ENV", "practice")
 
-MAX_INSTRUMENTS_PER_RUN = int(os.environ.get("MAX_INSTRUMENTS_PER_RUN", "5"))
-LLM_MAX_RETRIES = 5
-LLM_RETRY_DELAY = 10
+MAX_INSTRUMENTS_PER_RUN = int(os.environ.get("MAX_INSTRUMENTS_PER_RUN", "1"))
+LLM_MAX_RETRIES = 3
+LLM_RETRY_DELAY = 5
+RATE_LIMIT_COOLDOWN_SEC = 30
 
 llm_client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY)
 
@@ -30,7 +32,6 @@ MAX_CALLS_PER_MINUTE = 40
 RATE_LIMIT_WINDOW = 60
 RATE_LIMIT_WAIT_TIMEOUT = 5
 LAST_RATE_LIMIT = 0
-RATE_LIMIT_COOLDOWN_SEC = 120
 
 def _check_rate_limit() -> bool:
     global _llm_call_timestamps
@@ -103,10 +104,6 @@ def ai_pick_instruments() -> list:
     return []
 
 def ai_generate_strategy(instrument: str, current_best: dict = None) -> str:
-    """
-    Ask DeepSeek to write a complete Python bt.Strategy subclass for the instrument.
-    Returns the raw Python code as a string.
-    """
     system = (
         "You are an expert algorithmic trader. Write a COMPLETE Python class named 'UserStrategy' "
         "that inherits from backtrader.Strategy. The class must have at least an __init__ method "
@@ -137,7 +134,7 @@ def ai_generate_strategy(instrument: str, current_best: dict = None) -> str:
 
     return deepseek_chat(prompt, system)
 
-# ---------- MCP client helpers ----------
+# ---------- MCP client helpers with timeout ----------
 SERVER_PARAMS = StdioServerParameters(
     command="python",
     args=["oanda_mcp_server.py"],
@@ -145,18 +142,32 @@ SERVER_PARAMS = StdioServerParameters(
 )
 
 async def backtest(session, instrument: str, code: str) -> float:
-    result = await session.call_tool("backtest_python_strategy", {
-        "instrument": instrument,
-        "code": code
-    })
-    if result.content:
+    try:
+        async with asyncio.timeout(30):
+            result = await session.call_tool("backtest_python_strategy", {
+                "instrument": instrument,
+                "code": code
+            })
+    except asyncio.TimeoutError:
+        print("   ⏰ MCP backtest call timed out (30s).")
+        return 0.0
+
+    if result.content and len(result.content) > 0:
         text = result.content[0].text
         print(f"   Raw backtest response: {text[:500]}")
-        data = json.loads(text)
+        if not text or not text.strip():
+            print("   ⚠️ Empty response from MCP server.")
+            return 0.0
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            print("   ⚠️ Invalid JSON in backtest response.")
+            return 0.0
         if "error" in data:
             print(f"   Backtest error: {data['error']}")
             return 0.0
         return data.get("sharpe", 0.0)
+    print("   ⚠️ No content in backtest response.")
     return 0.0
 
 # ---------- Gist helpers ----------
@@ -225,7 +236,6 @@ async def main():
                 if not code:
                     print("   ❌ Could not get strategy code.")
                     continue
-                # Clean up markdown fences if any
                 if "```" in code:
                     code = code.split("```")[1]
                     if code.startswith("python"):
