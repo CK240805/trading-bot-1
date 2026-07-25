@@ -1,7 +1,7 @@
 """
 OANDA Universal Backtesting MCP Server
 Allows the AI to import only backtrader and math; otherwise sandboxed.
-Fixed sandbox: __name__ and __module__ set to safe defaults.
+Redirects stdout during backtest to prevent protocol corruption.
 """
 import asyncio, os, json, logging, sys, io
 from mcp.server import Server
@@ -16,7 +16,7 @@ import backtrader as bt
 import pandas as pd
 import math
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)   # ensure logs go to stderr
 logger = logging.getLogger("oanda-mcp")
 
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
@@ -41,13 +41,12 @@ def safe_import(name, *args, **kwargs):
         return __import__(name, *args, **kwargs)
     raise ImportError(f"Import of '{name}' is not allowed")
 
-# Minimal safe builtins – class‑definition names now use normal Python values
 SAFE_BUILTINS = {
     "__import__": safe_import,
     "__build_class__": __build_class__,
-    "__name__": "__main__",            # <-- normal module name
+    "__name__": "__main__",
     "__doc__": "",
-    "__module__": "__main__",          # <-- normal module name
+    "__module__": "__main__",
     "__qualname__": "UserStrategy",
     "True": True, "False": False, "None": None,
     "abs": abs, "all": all, "any": any, "bin": bin, "bool": bool,
@@ -92,7 +91,7 @@ def fetch_candles(instrument: str, granularity: str = "H1", count: int = 2000) -
         df.set_index("datetime", inplace=True)
     return df
 
-# ---------- Safe code execution ----------
+# ---------- Safe code execution with stdout redirect ----------
 def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
     local_namespace = {}
     try:
@@ -111,10 +110,20 @@ def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
     cerebro.broker.setcommission(commission=0.0001)
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=0.0, annualize=True)
 
+    # Redirect stdout to a dummy to catch any print() calls from the strategy or backtrader
+    old_stdout = sys.stdout
+    sys.stdout = io.StringIO()
     try:
         results = cerebro.run()
     except Exception as e:
+        sys.stdout = old_stdout
         return {"error": f"Backtest runtime error: {e}"}
+    finally:
+        # Discard captured output
+        captured = sys.stdout.getvalue()
+        sys.stdout = old_stdout
+        if captured:
+            logger.debug(f"Captured stdout: {captured[:200]}")
 
     strat = results[0]
     analysis = strat.analyzers.sharpe.get_analysis()
