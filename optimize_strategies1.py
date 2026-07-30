@@ -1,7 +1,6 @@
 """
 OANDA Strategy Optimizer – DeepSeek generates complete Python trading strategies.
-The AI receives detailed performance feedback (Sharpe, return %, win rate, avg win/loss)
-and is instructed to improve based on those metrics.
+Now handles MCP connection failures gracefully.
 """
 import os, json, time, asyncio, requests
 from collections import deque
@@ -25,6 +24,24 @@ LLM_RETRY_DELAY = 5
 RATE_LIMIT_COOLDOWN_SEC = 30
 
 llm_client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_API_KEY)
+
+# ---------- Default fallback strategy ----------
+DEFAULT_STRATEGY_CODE = """import backtrader as bt
+
+class UserStrategy(bt.Strategy):
+    params = (('sma_fast', 10), ('sma_slow', 30))
+
+    def __init__(self):
+        self.sma_fast = bt.indicators.SMA(self.data.close, period=self.p.sma_fast)
+        self.sma_slow = bt.indicators.SMA(self.data.close, period=self.p.sma_slow)
+        self.crossover = bt.indicators.CrossOver(self.sma_fast, self.sma_slow)
+
+    def next(self):
+        if self.crossover > 0:
+            self.buy()
+        elif self.crossover < 0:
+            self.sell()
+"""
 
 # ---------- Rate limiter ----------
 _llm_call_timestamps = deque()
@@ -107,16 +124,27 @@ def ai_generate_strategy(instrument: str, current_best: dict = None) -> str:
     system = (
         "You are an expert algorithmic trader. Write a COMPLETE Python class named 'UserStrategy' "
         "that inherits from backtrader.Strategy. The class must have at least an __init__ method "
-        "and a next() method. You can use any standard backtrader indicators (bt.indicators). "
-        "CRITICAL: The strategy must generate at least 1 trade every 7 days on average. "
-        "Include stop-loss, take-profit, or any risk management you want. "
-        "Return ONLY the Python code, no markdown, no explanations.\n\n"
-        "Example of a working strategy:\n"
+        "and a next() method.\n\n"
+        "SAFE INDICATORS (only use these):\n"
+        "- bt.indicators.SMA(period=...)\n"
+        "- bt.indicators.EMA(period=...)\n"
+        "- bt.indicators.RSI(period=...)\n"
+        "- bt.indicators.MACD(period_me1=12, period_me2=26, period_signal=9)\n"
+        "- bt.indicators.CrossOver(ind1, ind2)\n"
+        "- bt.indicators.BollingerBands(period=20, devfactor=2)\n"
+        "- bt.indicators.ATR(period=14)\n"
+        "- self.data.close, self.data.high, self.data.low\n\n"
+        "RULES:\n"
+        "1. Call self.buy() to enter long, self.sell() to enter short.\n"
+        "2. Use self.position to check current position.\n"
+        "3. The strategy MUST trade at least once per week.\n"
+        "4. Return ONLY the Python code, no markdown.\n\n"
+        "Example:\n"
         "class UserStrategy(bt.Strategy):\n"
         "    def __init__(self):\n"
         "        self.sma_fast = bt.indicators.SMA(self.data.close, period=10)\n"
         "        self.sma_slow = bt.indicators.SMA(self.data.close, period=30)\n"
-        "        self.crossover = bt.indicators.CrossOver(self.sma_fast, self.sma_slow)\n\n"
+        "        self.crossover = bt.indicators.CrossOver(self.sma_fast, self.sma_slow)\n"
         "    def next(self):\n"
         "        if self.crossover > 0:\n"
         "            self.buy()\n"
@@ -131,17 +159,18 @@ def ai_generate_strategy(instrument: str, current_best: dict = None) -> str:
             f"  Sharpe: {prev.get('sharpe', 'N/A')}\n"
             f"  Total Return: {prev.get('total_return_pct', 'N/A')}%\n"
             f"  Win Rate: {prev.get('win_rate', 'N/A')}%\n"
-            f"  Avg Win: {prev.get('avg_win', 'N/A')}\n"
-            f"  Avg Loss: {prev.get('avg_loss', 'N/A')}\n"
             f"  Total Trades: {prev.get('total_trades', 'N/A')}\n"
-            f"Previous strategy code:\n{prev.get('code', 'None')}\n\n"
-            "Please propose a completely new strategy that will improve the total return and Sharpe ratio. "
-            "Make it more selective to increase win rate, or use different indicators."
+            f"Previous code:\n{prev.get('code', 'None')}\n\n"
+            "Please propose a completely new strategy that will improve the total return and Sharpe ratio."
         )
     else:
         prompt = f"Write a Python trading strategy for {instrument} H1 that will definitely make trades (at least 1 per week)."
 
-    return deepseek_chat(prompt, system)
+    code = deepseek_chat(prompt, system)
+    if not code or "class UserStrategy" not in code:
+        print("   ⚠️ AI returned invalid code; using default SMA crossover.")
+        return DEFAULT_STRATEGY_CODE
+    return code
 
 # ---------- MCP client helpers ----------
 SERVER_PARAMS = StdioServerParameters(
@@ -151,7 +180,6 @@ SERVER_PARAMS = StdioServerParameters(
 )
 
 async def backtest(session, instrument: str, code: str) -> dict:
-    """Return a dict with all performance metrics, or all zeros on failure."""
     default = {
         "sharpe": 0.0, "total_trades": 0, "total_return_pct": 0.0,
         "win_rate": 0.0, "avg_win": 0.0, "avg_loss": 0.0
@@ -164,6 +192,9 @@ async def backtest(session, instrument: str, code: str) -> dict:
             })
     except asyncio.TimeoutError:
         print("   ⏰ MCP backtest call timed out (30s).")
+        return default
+    except Exception as e:
+        print(f"   ❌ MCP backtest call failed: {e}")
         return default
 
     if result.content and len(result.content) > 0:
@@ -179,7 +210,6 @@ async def backtest(session, instrument: str, code: str) -> dict:
         if "error" in data:
             print(f"   Backtest error: {data['error']}")
             return default
-        # Merge with defaults to fill any missing keys
         for k in default:
             if k not in data:
                 data[k] = default[k]
@@ -240,49 +270,53 @@ async def main():
         print("AI selection failed, using default list.")
     print(f"AI selected instruments: {instruments}")
 
-    async with stdio_client(SERVER_PARAMS) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
+    # Try to connect to MCP server, but don't crash if it fails
+    try:
+        async with stdio_client(SERVER_PARAMS) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
 
-            for instrument in instruments[:MAX_INSTRUMENTS_PER_RUN]:
-                current_best = best_strategies.get(instrument)
-                current_sharpe = current_best.get("sharpe", -9999) if current_best else -9999
-                print(f"\n📊 Optimizing {instrument} (best Sharpe: {current_sharpe:.3f})…")
+                for instrument in instruments[:MAX_INSTRUMENTS_PER_RUN]:
+                    current_best = best_strategies.get(instrument)
+                    current_sharpe = current_best.get("sharpe", -9999) if current_best else -9999
+                    print(f"\n📊 Optimizing {instrument} (best Sharpe: {current_sharpe:.3f})…")
 
-                code = ai_generate_strategy(instrument, current_best)
-                if not code:
-                    print("   ❌ Could not get strategy code.")
-                    continue
-                if "```" in code:
-                    code = code.split("```")[1]
-                    if code.startswith("python"):
-                        code = code[6:].strip()
+                    code = ai_generate_strategy(instrument, current_best)
+                    if not code:
+                        print("   ❌ Could not get strategy code; using default.")
+                        code = DEFAULT_STRATEGY_CODE
+                    if "```" in code:
+                        code = code.split("```")[1]
+                        if code.startswith("python"):
+                            code = code[6:].strip()
 
-                print(f"   Generated strategy (first 200 chars): {code[:200]}")
+                    print(f"   Generated strategy (first 200 chars): {code[:200]}")
 
-                result = await backtest(session, instrument, code)
-                sharpe = result["sharpe"]
-                trades = result["total_trades"]
-                print(f"   Sharpe = {sharpe:.3f}, Trades = {trades}, "
-                      f"Return = {result['total_return_pct']:.2f}%, Win Rate = {result['win_rate']:.1f}%")
+                    result = await backtest(session, instrument, code)
+                    sharpe = result["sharpe"]
+                    trades = result["total_trades"]
+                    print(f"   Sharpe = {sharpe:.3f}, Trades = {trades}, "
+                          f"Return = {result['total_return_pct']:.2f}%, Win Rate = {result['win_rate']:.1f}%")
 
-                if sharpe > current_sharpe:
-                    # Save everything we got back + the code
-                    best_strategies[instrument] = {
-                        "code": code,
-                        **result,
-                        "optimized_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")
-                    }
-                    print(f"   ✅ Improved! New best Sharpe: {sharpe:.3f}")
+                    if sharpe > current_sharpe:
+                        best_strategies[instrument] = {
+                            "code": code,
+                            **result,
+                            "optimized_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        }
+                        print(f"   ✅ Improved! New best Sharpe: {sharpe:.3f}")
 
-                    write_gist(gist_id, {
-                        "virtual_balance": state.get("virtual_balance", 100.0),
-                        "trading_paused": state.get("trading_paused", False),
-                        "best_strategies": best_strategies,
-                        "last_optimized": time.strftime("%Y-%m-%dT%H:%M:%SZ")
-                    })
+                        write_gist(gist_id, {
+                            "virtual_balance": state.get("virtual_balance", 100.0),
+                            "trading_paused": state.get("trading_paused", False),
+                            "best_strategies": best_strategies,
+                            "last_optimized": time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        })
 
-                await asyncio.sleep(3)
+                    await asyncio.sleep(3)
+    except Exception as e:
+        print(f"❌ MCP server connection failed: {e}")
+        print("   The OANDA MCP server may have crashed. Check its logs.")
 
     print(f"\n🏁 Optimization finished. Strategies saved: {list(best_strategies.keys())}")
 
