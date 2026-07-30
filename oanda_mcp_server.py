@@ -1,9 +1,8 @@
 """
-OANDA Universal Backtesting MCP Server (updated for MCP >= 1.0)
-Uses the new @server.tool() decorator syntax.
+OANDA Universal Backtesting MCP Server (low‑level API – compatible with all mcp versions)
 """
 import asyncio, os, json, logging, sys, io
-from mcp.server import Server
+from mcp.server.lowlevel import Server
 from mcp.types import Tool, TextContent
 from mcp.server.stdio import stdio_server
 
@@ -29,7 +28,6 @@ else:
 
 oanda = API(access_token=OANDA_API_KEY, environment=OANDA_ENV)
 
-# Create server with a name
 app = Server("oanda-backtest")
 
 # ---------- Restricted import function ----------
@@ -152,25 +150,52 @@ def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
         "avg_loss": round(avg_loss, 4)
     }
 
-# ---------- MCP tools (new decorator syntax) ----------
-@app.tool(name="list_instruments", description="List all tradeable instruments on the OANDA account")
-async def list_instruments():
-    try:
-        r = accounts.AccountInstruments(accountID=OANDA_ACCOUNT_ID)
-        resp = oanda.request(r)
-        names = [i["name"] for i in resp.get("instruments", [])]
-        return [TextContent(type="text", text=json.dumps(names))]
-    except Exception as e:
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+# ---------- Tool definitions ----------
+@app.list_tools()
+async def list_tools() -> list[Tool]:
+    return [
+        Tool(
+            name="list_instruments",
+            description="List all tradeable instruments on the OANDA account",
+            inputSchema={"type": "object", "properties": {}}
+        ),
+        Tool(
+            name="backtest_python_strategy",
+            description="Backtest a Python strategy (bt.Strategy subclass) on OANDA data and return performance metrics.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "instrument": {"type": "string", "description": "e.g. EUR_USD"},
+                    "granularity": {"type": "string", "default": "H1"},
+                    "code": {"type": "string", "description": "Full Python code defining a 'UserStrategy' class"}
+                },
+                "required": ["instrument", "code"]
+            }
+        )
+    ]
 
-@app.tool(name="backtest_python_strategy",
-          description="Backtest a user-provided Python strategy (bt.Strategy subclass) on OANDA data and return performance metrics.")
-async def backtest_python_strategy(instrument: str, granularity: str = "H1", code: str = ""):
-    df = fetch_candles(instrument, granularity)
-    if df.empty:
-        return [TextContent(type="text", text=json.dumps({"error": "No OANDA data (check instrument name or API key)"}))]
-    result = run_user_strategy(df, code)
-    return [TextContent(type="text", text=json.dumps(result))]
+@app.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    if name == "list_instruments":
+        try:
+            r = accounts.AccountInstruments(accountID=OANDA_ACCOUNT_ID)
+            resp = oanda.request(r)
+            names = [i["name"] for i in resp.get("instruments", [])]
+            return [TextContent(type="text", text=json.dumps(names))]
+        except Exception as e:
+            return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+
+    elif name == "backtest_python_strategy":
+        instrument = arguments["instrument"]
+        granularity = arguments.get("granularity", "H1")
+        code = arguments["code"]
+        df = fetch_candles(instrument, granularity)
+        if df.empty:
+            return [TextContent(type="text", text=json.dumps({"error": "No OANDA data"}))]
+        result = run_user_strategy(df, code)
+        return [TextContent(type="text", text=json.dumps(result))]
+
+    raise ValueError(f"Unknown tool: {name}")
 
 async def main():
     async with stdio_server() as (read_stream, write_stream):
