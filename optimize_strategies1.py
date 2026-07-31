@@ -2,7 +2,7 @@
 OANDA Strategy Optimizer – DeepSeek generates complete Python trading strategies.
 - Fetches real OANDA instruments from MCP server and lets DeepSeek choose 5 to optimise.
 - Only saves strategies with positive total return.
-- Uses detailed metrics for feedback.
+- Logs the raw AI instrument selection response for debugging.
 """
 import os, json, time, asyncio, requests
 from collections import deque
@@ -104,14 +104,10 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
 
 # ---------- AI helpers ----------
 def ai_pick_instruments(available: list = None) -> list:
-    """
-    Ask DeepSeek to choose 5 instruments from the provided list.
-    If no list is given or the call fails, return an empty list.
-    """
+    """Ask DeepSeek to choose 5 instruments from the provided list. Returns list or [] on failure."""
     if not available:
         return []
 
-    # Truncate the list if too long (DeepSeek can handle up to 200 tokens, this is fine)
     instruments_str = ", ".join(available[:200])
     system = (
         "You are a senior financial market analyst. "
@@ -121,6 +117,14 @@ def ai_pick_instruments(available: list = None) -> list:
     )
     prompt = f"Available instruments: {instruments_str}\n\nWhich 5 would you choose?"
     response = deepseek_chat(prompt, system)
+
+    # --- Diagnostic logging ---
+    if not response:
+        print("[AI instrument selection] LLM returned empty/None (likely API error or cooldown)")
+    else:
+        print(f"[AI instrument selection] Raw response: {response[:300]}")
+    # -------------------------
+
     if not response:
         return []
     try:
@@ -128,12 +132,14 @@ def ai_pick_instruments(available: list = None) -> list:
             response = response.split("```")[1].replace("json", "").strip()
         instruments = json.loads(response)
         if isinstance(instruments, list) and len(instruments) >= 1:
-            # Filter to only valid instruments from the available list
             valid = [i for i in instruments if i in available]
             if len(valid) >= 1:
+                print(f"[AI instrument selection] Validated choices: {valid}")
                 return valid[:5]
-    except:
-        pass
+            else:
+                print("[AI instrument selection] No valid instrument in AI response")
+    except Exception as e:
+        print(f"[AI instrument selection] Failed to parse response: {e}")
     return []
 
 def ai_generate_strategy(instrument: str, current_best: dict = None) -> str:
@@ -199,7 +205,6 @@ SERVER_PARAMS = StdioServerParameters(
 )
 
 async def fetch_available_instruments(session) -> list:
-    """Fetch all OANDA instruments from the MCP server."""
     try:
         result = await session.call_tool("list_instruments", {})
         if result.content and len(result.content) > 0:
@@ -296,7 +301,6 @@ async def main():
         print(f"⚠️ Could not read Gist ({e}). Using empty state.")
     best_strategies = state.get("best_strategies", {})
 
-    # Default instruments in case everything fails
     DEFAULT_INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
 
     instruments = []
@@ -305,12 +309,10 @@ async def main():
             async with ClientSession(read, write) as session:
                 await session.initialize()
 
-                # 1. Fetch real OANDA instruments
                 print("📡 Fetching available OANDA instruments…")
                 available = await fetch_available_instruments(session)
                 print(f"   Found {len(available)} instruments.")
 
-                # 2. Let DeepSeek pick from the real list
                 if available:
                     instruments = ai_pick_instruments(available)
                 if not instruments:
@@ -318,7 +320,6 @@ async def main():
                     instruments = DEFAULT_INSTRUMENTS
                 print(f"   Selected instruments: {instruments}")
 
-                # 3. Optimize each instrument
                 for instrument in instruments[:MAX_INSTRUMENTS_PER_RUN]:
                     current_best = best_strategies.get(instrument)
                     current_return = current_best.get("total_return_pct", -9999) if current_best else -9999
