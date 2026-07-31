@@ -138,10 +138,18 @@ def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
     won = trade_analysis.get('won', {}) if isinstance(trade_analysis, dict) else {}
     lost = trade_analysis.get('lost', {}) if isinstance(trade_analysis, dict) else {}
 
-    won_pnl = won.get('pnl', {}) if isinstance(won, dict) else {}
-    lost_pnl = lost.get('pnl', {}) if isinstance(lost, dict) else {}
-    avg_win = won_pnl.get('net', {}).get('average', 0) if isinstance(won_pnl, dict) else 0
-    avg_loss = lost_pnl.get('net', {}).get('average', 0) if isinstance(lost_pnl, dict) else 0
+    # ----- Correctly extract avg win / avg loss -----
+    avg_win = 0.0
+    avg_loss = 0.0
+    if isinstance(won, dict):
+        pnl = won.get('pnl', {})
+        if isinstance(pnl, dict):
+            avg_win = pnl.get('average', 0.0)
+    if isinstance(lost, dict):
+        pnl = lost.get('pnl', {})
+        if isinstance(pnl, dict):
+            avg_loss = abs(pnl.get('average', 0.0))
+
     won_total = won.get('total', 0) if isinstance(won, dict) else 0
     win_rate = round((won_total / total_closed) * 100, 1) if total_closed > 0 else 0.0
 
@@ -151,7 +159,7 @@ def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
         "total_return_pct": total_return_pct,
         "win_rate": win_rate,
         "avg_win": round(avg_win, 2),
-        "avg_loss": round(abs(avg_loss), 2)
+        "avg_loss": round(avg_loss, 2)
     }
 
 # ---------- MCP tools ----------
