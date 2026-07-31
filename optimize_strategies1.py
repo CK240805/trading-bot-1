@@ -1,7 +1,8 @@
 """
 OANDA Strategy Optimizer – DeepSeek generates complete Python trading strategies.
-Only saves strategies with positive total return. Retries instruments until a
-profitable strategy is found (max 1 attempt per run).
+- Fetches real OANDA instruments from MCP server and lets DeepSeek choose 5 to optimise.
+- Only saves strategies with positive total return.
+- Uses detailed metrics for feedback.
 """
 import os, json, time, asyncio, requests
 from collections import deque
@@ -102,21 +103,35 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
     return ""
 
 # ---------- AI helpers ----------
-def ai_pick_instruments() -> list:
+def ai_pick_instruments(available: list = None) -> list:
+    """
+    Ask DeepSeek to choose 5 instruments from the provided list.
+    If no list is given or the call fails, return an empty list.
+    """
+    if not available:
+        return []
+
+    # Truncate the list if too long (DeepSeek can handle up to 200 tokens, this is fine)
+    instruments_str = ", ".join(available[:200])
     system = (
         "You are a senior financial market analyst. "
-        "Select the 5 most important OANDA instruments to optimise trading strategies for today. "
-        "Return ONLY a JSON array of OANDA instrument names, e.g. ['EUR_USD','XAU_USD']."
+        f"From the following list of available OANDA instruments, select the 5 most important "
+        f"ones to optimise trading strategies for today. "
+        "Return ONLY a valid JSON array of exactly 5 instrument names, e.g. ['EUR_USD','XAU_USD']."
     )
-    response = deepseek_chat("What are the top 5 instruments to optimise trading strategies for today?", system)
+    prompt = f"Available instruments: {instruments_str}\n\nWhich 5 would you choose?"
+    response = deepseek_chat(prompt, system)
     if not response:
         return []
     try:
         if "```" in response:
             response = response.split("```")[1].replace("json", "").strip()
         instruments = json.loads(response)
-        if isinstance(instruments, list):
-            return instruments[:5]
+        if isinstance(instruments, list) and len(instruments) >= 1:
+            # Filter to only valid instruments from the available list
+            valid = [i for i in instruments if i in available]
+            if len(valid) >= 1:
+                return valid[:5]
     except:
         pass
     return []
@@ -182,6 +197,19 @@ SERVER_PARAMS = StdioServerParameters(
     args=["oanda_mcp_server.py"],
     env=os.environ.copy()
 )
+
+async def fetch_available_instruments(session) -> list:
+    """Fetch all OANDA instruments from the MCP server."""
+    try:
+        result = await session.call_tool("list_instruments", {})
+        if result.content and len(result.content) > 0:
+            text = result.content[0].text
+            data = json.loads(text)
+            if isinstance(data, list):
+                return data
+    except Exception as e:
+        print(f"   ⚠️ Failed to fetch instruments: {e}")
+    return []
 
 async def backtest(session, instrument: str, code: str) -> dict:
     default = {
@@ -268,17 +296,29 @@ async def main():
         print(f"⚠️ Could not read Gist ({e}). Using empty state.")
     best_strategies = state.get("best_strategies", {})
 
-    instruments = ai_pick_instruments()
-    if not instruments:
-        instruments = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
-        print("AI selection failed, using default list.")
-    print(f"AI selected instruments: {instruments}")
+    # Default instruments in case everything fails
+    DEFAULT_INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "US30_USD"]
 
+    instruments = []
     try:
         async with stdio_client(SERVER_PARAMS) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
 
+                # 1. Fetch real OANDA instruments
+                print("📡 Fetching available OANDA instruments…")
+                available = await fetch_available_instruments(session)
+                print(f"   Found {len(available)} instruments.")
+
+                # 2. Let DeepSeek pick from the real list
+                if available:
+                    instruments = ai_pick_instruments(available)
+                if not instruments:
+                    print("   AI selection failed or returned empty, using default list.")
+                    instruments = DEFAULT_INSTRUMENTS
+                print(f"   Selected instruments: {instruments}")
+
+                # 3. Optimize each instrument
                 for instrument in instruments[:MAX_INSTRUMENTS_PER_RUN]:
                     current_best = best_strategies.get(instrument)
                     current_return = current_best.get("total_return_pct", -9999) if current_best else -9999
@@ -302,7 +342,8 @@ async def main():
                     win = result["win_rate"]
                     avg_win = result["avg_win"]
                     avg_loss = result["avg_loss"]
-                    print(f"   Return = {ret:.2f}%, Win Rate = {win:.1f}%, Avg Win = {avg_win:.2f}, Avg Loss = {avg_loss:.2f}, Trades = {trades}, Sharpe = {sharpe:.3f}")
+                    print(f"   Return = {ret:.2f}%, Win Rate = {win:.1f}%, "
+                          f"Avg Win = {avg_win:.2f}, Avg Loss = {avg_loss:.2f}, Trades = {trades}, Sharpe = {sharpe:.3f}")
 
                     if ret > current_return and ret > 0:
                         best_strategies[instrument] = {
@@ -323,7 +364,8 @@ async def main():
 
                     await asyncio.sleep(3)
     except Exception as e:
-        print(f"❌ MCP server connection failed: {e}")
+        print(f"❌ Could not connect to MCP server: {e}")
+        print("   Optimization skipped for this run.")
 
     print(f"\n🏁 Optimization finished. Strategies saved: {list(best_strategies.keys())}")
 
