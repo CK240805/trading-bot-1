@@ -2,7 +2,7 @@
 OANDA Strategy Optimizer – DeepSeek generates complete Python trading strategies.
 - Fetches real OANDA instruments from MCP server and lets DeepSeek choose 5 to optimise.
 - Only saves strategies with positive total return.
-- Logs the raw AI instrument selection response for debugging.
+- Handles single-quoted JSON from the AI gracefully.
 """
 import os, json, time, asyncio, requests
 from collections import deque
@@ -118,19 +118,21 @@ def ai_pick_instruments(available: list = None) -> list:
     prompt = f"Available instruments: {instruments_str}\n\nWhich 5 would you choose?"
     response = deepseek_chat(prompt, system)
 
-    # --- Diagnostic logging ---
     if not response:
         print("[AI instrument selection] LLM returned empty/None (likely API error or cooldown)")
-    else:
-        print(f"[AI instrument selection] Raw response: {response[:300]}")
-    # -------------------------
-
-    if not response:
         return []
+
+    print(f"[AI instrument selection] Raw response: {response[:300]}")
+
     try:
+        # Clean markdown fences
         if "```" in response:
             response = response.split("```")[1].replace("json", "").strip()
-        instruments = json.loads(response)
+
+        # Replace single quotes with double quotes (common LLM mistake)
+        cleaned = response.strip().replace("'", '"')
+
+        instruments = json.loads(cleaned)
         if isinstance(instruments, list) and len(instruments) >= 1:
             valid = [i for i in instruments if i in available]
             if len(valid) >= 1:
