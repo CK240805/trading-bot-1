@@ -1,8 +1,8 @@
 """
-OANDA Universal Backtesting MCP Server (low‑level API – compatible with all mcp versions)
+OANDA Universal Backtesting MCP Server (compatible with mcp==0.9.x)
 """
 import asyncio, os, json, logging, sys, io
-from mcp.server.lowlevel import Server
+from mcp.server import Server
 from mcp.types import Tool, TextContent
 from mcp.server.stdio import stdio_server
 
@@ -150,9 +150,9 @@ def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
         "avg_loss": round(avg_loss, 4)
     }
 
-# ---------- Tool definitions ----------
+# ---------- MCP tools (old stable API) ----------
 @app.list_tools()
-async def list_tools() -> list[Tool]:
+async def list_tools():
     return [
         Tool(
             name="list_instruments",
@@ -175,7 +175,7 @@ async def list_tools() -> list[Tool]:
     ]
 
 @app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict):
     if name == "list_instruments":
         try:
             r = accounts.AccountInstruments(accountID=OANDA_ACCOUNT_ID)
