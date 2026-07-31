@@ -1,7 +1,6 @@
 """
 OANDA Strategy Optimizer – DeepSeek generates complete Python trading strategies.
-Compares strategies by total return % and win rate (not just Sharpe).
-Handles 529 errors gracefully.
+Only saves strategies with positive total return. Uses detailed metrics for feedback.
 """
 import os, json, time, asyncio, requests
 from collections import deque
@@ -139,7 +138,8 @@ def ai_generate_strategy(instrument: str, current_best: dict = None) -> str:
         "1. Call self.buy() to enter long, self.sell() to enter short.\n"
         "2. Use self.position to check current position.\n"
         "3. The strategy MUST trade at least once per week.\n"
-        "4. Return ONLY the Python code, no markdown.\n\n"
+        "4. The goal is to end the backtest with a POSITIVE total return (>0%).\n"
+        "5. Return ONLY the Python code, no markdown.\n\n"
         "Example:\n"
         "class UserStrategy(bt.Strategy):\n"
         "    def __init__(self):\n"
@@ -156,16 +156,17 @@ def ai_generate_strategy(instrument: str, current_best: dict = None) -> str:
         prev = current_best
         prompt = (
             f"Instrument: {instrument} H1\n"
-            f"Previous strategy metrics:\n"
+            f"Previous best strategy metrics:\n"
             f"  Total Return: {prev.get('total_return_pct', 'N/A')}%\n"
             f"  Win Rate: {prev.get('win_rate', 'N/A')}%\n"
+            f"  Avg Win: {prev.get('avg_win', 'N/A')}  Avg Loss: {prev.get('avg_loss', 'N/A')}\n"
             f"  Total Trades: {prev.get('total_trades', 'N/A')}\n"
-            f"  Sharpe: {prev.get('sharpe', 'N/A')}\n"
             f"Previous code:\n{prev.get('code', 'None')}\n\n"
-            "Please propose a completely new strategy that will IMPROVE the total return % and win rate."
+            "Please propose a completely new strategy that will IMPROVE the total return % and win rate, "
+            "and achieve a positive total return."
         )
     else:
-        prompt = f"Write a Python trading strategy for {instrument} H1 that will definitely make trades (at least 1 per week)."
+        prompt = f"Write a Python trading strategy for {instrument} H1 that will definitely make trades and end with a positive total return."
 
     code = deepseek_chat(prompt, system)
     if not code or "class UserStrategy" not in code:
@@ -297,16 +298,18 @@ async def main():
                     trades = result["total_trades"]
                     sharpe = result["sharpe"]
                     win = result["win_rate"]
-                    print(f"   Return = {ret:.2f}%, Win Rate = {win:.1f}%, Trades = {trades}, Sharpe = {sharpe:.3f}")
+                    avg_win = result["avg_win"]
+                    avg_loss = result["avg_loss"]
+                    print(f"   Return = {ret:.2f}%, Win Rate = {win:.1f}%, Avg Win = {avg_win}, Avg Loss = {avg_loss}, Trades = {trades}, Sharpe = {sharpe:.3f}")
 
-                    # Save if total return improved
-                    if ret > current_return:
+                    # Save only if total return is positive and better than before
+                    if ret > current_return and ret > 0:
                         best_strategies[instrument] = {
                             "code": code,
                             **result,
                             "optimized_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")
                         }
-                        print(f"   ✅ Improved! New best return: {ret:.2f}%")
+                        print(f"   ✅ New profitable strategy saved! Return = {ret:.2f}%")
 
                         write_gist(gist_id, {
                             "virtual_balance": state.get("virtual_balance", 100.0),
@@ -315,7 +318,7 @@ async def main():
                             "last_optimized": time.strftime("%Y-%m-%dT%H:%M:%SZ")
                         })
                     else:
-                        print(f"   No improvement (best return: {current_return:.2f}%)")
+                        print(f"   Skipped (not profitable or no improvement)")
 
                     await asyncio.sleep(3)
     except Exception as e:
