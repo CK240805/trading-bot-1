@@ -1,6 +1,7 @@
 """
 OANDA Strategy Optimizer – DeepSeek generates complete Python trading strategies.
-Now handles MCP connection failures gracefully.
+Compares strategies by total return % and win rate (not just Sharpe).
+Handles 529 errors gracefully.
 """
 import os, json, time, asyncio, requests
 from collections import deque
@@ -91,7 +92,7 @@ def deepseek_chat(prompt: str, system: str = "") -> str:
             return resp.choices[0].message.content
         except Exception as e:
             print(f"LLM API error (attempt {attempt+1}/{LLM_MAX_RETRIES}): {e}")
-            if "429" in str(e) or "503" in str(e):
+            if any(code in str(e) for code in ["429", "503", "529"]):
                 LAST_RATE_LIMIT = time.time()
                 delay = LLM_RETRY_DELAY * (attempt + 1)
                 print(f"Retrying in {delay}s…")
@@ -156,12 +157,12 @@ def ai_generate_strategy(instrument: str, current_best: dict = None) -> str:
         prompt = (
             f"Instrument: {instrument} H1\n"
             f"Previous strategy metrics:\n"
-            f"  Sharpe: {prev.get('sharpe', 'N/A')}\n"
             f"  Total Return: {prev.get('total_return_pct', 'N/A')}%\n"
             f"  Win Rate: {prev.get('win_rate', 'N/A')}%\n"
             f"  Total Trades: {prev.get('total_trades', 'N/A')}\n"
+            f"  Sharpe: {prev.get('sharpe', 'N/A')}\n"
             f"Previous code:\n{prev.get('code', 'None')}\n\n"
-            "Please propose a completely new strategy that will improve the total return and Sharpe ratio."
+            "Please propose a completely new strategy that will IMPROVE the total return % and win rate."
         )
     else:
         prompt = f"Write a Python trading strategy for {instrument} H1 that will definitely make trades (at least 1 per week)."
@@ -270,7 +271,6 @@ async def main():
         print("AI selection failed, using default list.")
     print(f"AI selected instruments: {instruments}")
 
-    # Try to connect to MCP server, but don't crash if it fails
     try:
         async with stdio_client(SERVER_PARAMS) as (read, write):
             async with ClientSession(read, write) as session:
@@ -278,8 +278,8 @@ async def main():
 
                 for instrument in instruments[:MAX_INSTRUMENTS_PER_RUN]:
                     current_best = best_strategies.get(instrument)
-                    current_sharpe = current_best.get("sharpe", -9999) if current_best else -9999
-                    print(f"\n📊 Optimizing {instrument} (best Sharpe: {current_sharpe:.3f})…")
+                    current_return = current_best.get("total_return_pct", -9999) if current_best else -9999
+                    print(f"\n📊 Optimizing {instrument} (best return: {current_return:.2f}%)…")
 
                     code = ai_generate_strategy(instrument, current_best)
                     if not code:
@@ -293,18 +293,20 @@ async def main():
                     print(f"   Generated strategy (first 200 chars): {code[:200]}")
 
                     result = await backtest(session, instrument, code)
-                    sharpe = result["sharpe"]
+                    ret = result["total_return_pct"]
                     trades = result["total_trades"]
-                    print(f"   Sharpe = {sharpe:.3f}, Trades = {trades}, "
-                          f"Return = {result['total_return_pct']:.2f}%, Win Rate = {result['win_rate']:.1f}%")
+                    sharpe = result["sharpe"]
+                    win = result["win_rate"]
+                    print(f"   Return = {ret:.2f}%, Win Rate = {win:.1f}%, Trades = {trades}, Sharpe = {sharpe:.3f}")
 
-                    if sharpe > current_sharpe:
+                    # Save if total return improved
+                    if ret > current_return:
                         best_strategies[instrument] = {
                             "code": code,
                             **result,
                             "optimized_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")
                         }
-                        print(f"   ✅ Improved! New best Sharpe: {sharpe:.3f}")
+                        print(f"   ✅ Improved! New best return: {ret:.2f}%")
 
                         write_gist(gist_id, {
                             "virtual_balance": state.get("virtual_balance", 100.0),
@@ -312,11 +314,12 @@ async def main():
                             "best_strategies": best_strategies,
                             "last_optimized": time.strftime("%Y-%m-%dT%H:%M:%SZ")
                         })
+                    else:
+                        print(f"   No improvement (best return: {current_return:.2f}%)")
 
                     await asyncio.sleep(3)
     except Exception as e:
         print(f"❌ MCP server connection failed: {e}")
-        print("   The OANDA MCP server may have crashed. Check its logs.")
 
     print(f"\n🏁 Optimization finished. Strategies saved: {list(best_strategies.keys())}")
 
