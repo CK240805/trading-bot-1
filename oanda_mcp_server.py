@@ -1,5 +1,6 @@
 """
 OANDA Universal Backtesting MCP Server (compatible with mcp==0.9.x)
+Returns Sharpe, total return %, total trades, win rate, average win, average loss.
 """
 import asyncio, os, json, logging, sys, io
 from mcp.server import Server
@@ -136,9 +137,12 @@ def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
     total_closed = trade_analysis.get('total', {}).get('closed', 0) if isinstance(trade_analysis, dict) else 0
     won = trade_analysis.get('won', {}) if isinstance(trade_analysis, dict) else {}
     lost = trade_analysis.get('lost', {}) if isinstance(trade_analysis, dict) else {}
+
+    won_pnl = won.get('pnl', {}) if isinstance(won, dict) else {}
+    lost_pnl = lost.get('pnl', {}) if isinstance(lost, dict) else {}
+    avg_win = won_pnl.get('net', {}).get('average', 0) if isinstance(won_pnl, dict) else 0
+    avg_loss = lost_pnl.get('net', {}).get('average', 0) if isinstance(lost_pnl, dict) else 0
     won_total = won.get('total', 0) if isinstance(won, dict) else 0
-    avg_win = won.get('average', 0) if isinstance(won, dict) else 0
-    avg_loss = lost.get('average', 0) if isinstance(lost, dict) else 0
     win_rate = round((won_total / total_closed) * 100, 1) if total_closed > 0 else 0.0
 
     return {
@@ -146,11 +150,11 @@ def run_user_strategy(df: pd.DataFrame, code: str) -> dict:
         "total_trades": total_closed,
         "total_return_pct": total_return_pct,
         "win_rate": win_rate,
-        "avg_win": round(avg_win, 4),
-        "avg_loss": round(avg_loss, 4)
+        "avg_win": round(avg_win, 2),
+        "avg_loss": round(abs(avg_loss), 2)
     }
 
-# ---------- MCP tools (old stable API) ----------
+# ---------- MCP tools ----------
 @app.list_tools()
 async def list_tools():
     return [
