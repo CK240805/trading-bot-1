@@ -1,6 +1,7 @@
 """
 OANDA Strategy Optimizer – DeepSeek generates complete Python trading strategies.
-Only saves strategies with positive total return. Uses detailed metrics for feedback.
+Only saves strategies with positive total return. Retries instruments until a
+profitable strategy is found (max 1 attempt per run).
 """
 import os, json, time, asyncio, requests
 from collections import deque
@@ -139,7 +140,8 @@ def ai_generate_strategy(instrument: str, current_best: dict = None) -> str:
         "2. Use self.position to check current position.\n"
         "3. The strategy MUST trade at least once per week.\n"
         "4. The goal is to end the backtest with a POSITIVE total return (>0%).\n"
-        "5. Return ONLY the Python code, no markdown.\n\n"
+        "5. If the previous strategy had a loss, try a completely different indicator or exit logic.\n"
+        "6. Return ONLY the Python code, no markdown.\n\n"
         "Example:\n"
         "class UserStrategy(bt.Strategy):\n"
         "    def __init__(self):\n"
@@ -163,7 +165,7 @@ def ai_generate_strategy(instrument: str, current_best: dict = None) -> str:
             f"  Total Trades: {prev.get('total_trades', 'N/A')}\n"
             f"Previous code:\n{prev.get('code', 'None')}\n\n"
             "Please propose a completely new strategy that will IMPROVE the total return % and win rate, "
-            "and achieve a positive total return."
+            "and achieve a POSITIVE total return (>0%)."
         )
     else:
         prompt = f"Write a Python trading strategy for {instrument} H1 that will definitely make trades and end with a positive total return."
@@ -300,9 +302,8 @@ async def main():
                     win = result["win_rate"]
                     avg_win = result["avg_win"]
                     avg_loss = result["avg_loss"]
-                    print(f"   Return = {ret:.2f}%, Win Rate = {win:.1f}%, Avg Win = {avg_win}, Avg Loss = {avg_loss}, Trades = {trades}, Sharpe = {sharpe:.3f}")
+                    print(f"   Return = {ret:.2f}%, Win Rate = {win:.1f}%, Avg Win = {avg_win:.2f}, Avg Loss = {avg_loss:.2f}, Trades = {trades}, Sharpe = {sharpe:.3f}")
 
-                    # Save only if total return is positive and better than before
                     if ret > current_return and ret > 0:
                         best_strategies[instrument] = {
                             "code": code,
