@@ -19,7 +19,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install openai mcp==1.0.0 oandapyV20 backtrader pandas requests
+          pip install openai mcp==0.9.1 oandapyV20 backtrader pandas requests
 
       - name: Run OANDA optimization
         env:
